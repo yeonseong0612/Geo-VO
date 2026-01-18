@@ -2,19 +2,19 @@ import torch
 import numpy as np
 from scipy.spatial import Delaunay
 
-def compute_delaunay_edges(points):
-    if torch.is_tensor(points):
-        pts = points.detach().cpu().numpy()
-    else:
-        pts = points
+def compute_delaunay_edges(kpts):
+    if not isinstance(kpts, np.ndarray):
+        kpts = np.array(kpts)
+        
+    if len(kpts) < 3:
+        return np.zeros((2, 0))
 
-    tri = Delaunay(pts)
-
+    tri = Delaunay(kpts)
     edges = set()
     for simplex in tri.simplices:
-        edges.add(tuple(sorted((simplex[0], simplex[1]))))
-        edges.add(tuple(sorted((simplex[1], simplex[2]))))
-        edges.add(tuple(sorted((simplex[2], simplex[0]))))
-    edge_list = [[u, v] for u, v in edges] + [[v, u] for u, v in edges]
-
-    return torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+        for i in range(3):
+            u, v = simplex[i], simplex[(i + 1) % 3]
+            edges.add(tuple(sorted((u, v))))
+    
+    edges_np = np.array(list(edges)).T
+    return edges_np
