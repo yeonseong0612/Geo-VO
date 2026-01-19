@@ -3,7 +3,7 @@ import numpy as np
 from thirdparty.superpoint.superpoint import SuperPoint
 
 class SuperPointExtractor:
-    def __init__(self, weights="/Users/yeonseongsmac/01_Projects/Geo-VO/models/superpoint_v6_from_tf.pth",
+    def __init__(self, weights="/home/yskim/projects/Geo-VO/models/superpoint_v6_from_tf.pth",
                  max_keypoints=1000, device="cpu"):
         self.model = SuperPoint(max_num_keypoints=max_keypoints).to(device)
         state = torch.load(weights, map_location=device)
@@ -13,18 +13,21 @@ class SuperPointExtractor:
 
     @torch.no_grad()
     def __call__(self, image_tensor):
-        # 1. 이미 Tensor가 들어오므로 변환 과정 생략 (또는 안전하게 검사)
-        if isinstance(image_tensor, np.ndarray):
-            image_tensor = torch.from_numpy(image_tensor/255.).float()[None, None]
-        
         image_tensor = image_tensor.to(self.device)
-        
-        # 2. 모델 추론
+
+        if image_tensor.shape[1] == 3:
+            image_tensor = image_tensor.mean(dim=1, keepdim=True)
+
         out = self.model({"image": image_tensor})
         
-        # 3. Tensor 상태 그대로 리턴 (Batch 차원 제거)
-        kpts = out["keypoints"][0]            # (N, 2) Tensor
-        desc = out["descriptors"][0].T        # (N, 256) Tensor로 Transpose
-        scores = out["keypoint_scores"][0]    # (N,) Tensor
-        
-        return kpts, desc, scores
+        kpts = out["keypoints"]          
+        desc = out["descriptors"]         
+        if isinstance(kpts, list):
+            kpts = torch.stack(kpts)
+
+        if isinstance(desc, list):
+            desc = torch.stack(desc)
+
+        desc = desc.transpose(1, 2)
+
+        return kpts, desc

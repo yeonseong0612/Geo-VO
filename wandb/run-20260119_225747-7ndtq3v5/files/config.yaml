@@ -1,0 +1,93 @@
+_wandb:
+    value:
+        cli_version: 0.24.0
+        e:
+            vs1e8d4du4zv3bx9wiogikwwnnsml2gu:
+                codePath: train.py
+                codePathLocal: train.py
+                cpu_count: 20
+                cpu_count_logical: 20
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "1081101176832"
+                        used: "171662368768"
+                email: cion2780@gmail.com
+                executable: /home/yskim/miniconda3/envs/geovo/bin/python
+                git:
+                    commit: 916c735ff7fcbf5584f0a2800432c8ec3cc8cf3e
+                    remote: https://github.com/yeonseong0612/Geo-VO.git
+                gpu: NVIDIA GeForce RTX 4060 Ti
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ada
+                      memoryTotal: "8585740288"
+                      name: NVIDIA GeForce RTX 4060 Ti
+                      uuid: GPU-6fdcd952-bdaa-72a8-dd67-286fec3dbfe6
+                host: DESKTOP-LRJVQNQ
+                memory:
+                    total: "8035414016"
+                os: Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.35
+                program: /home/yskim/projects/Geo-VO/train.py
+                python: CPython 3.10.14
+                root: /home/yskim/projects/Geo-VO
+                startedAt: "2026-01-19T13:57:47.450728Z"
+                writerId: vs1e8d4du4zv3bx9wiogikwwnnsml2gu
+        m: []
+        python_version: 3.10.14
+        t:
+            "1":
+                - 1
+                - 77
+            "2":
+                - 1
+                - 77
+            "3":
+                - 16
+            "4": 3.10.14
+            "5": 0.24.0
+            "12": 0.24.0
+            "13": linux-x86_64
+MultiStepLR_gamma:
+    value: 0.1
+MultiStepLR_milstone:
+    value:
+        - 30
+        - 50
+batchsize:
+    value: 4
+calib_subdir:
+    value: data_odometry_calib/dataset/sequences/
+color_subdir:
+    value: data_odometry_color/dataset/sequences/
+learning_rate:
+    value: 0.0001
+logdir:
+    value: /home/jnu-ie/kys/GEO-VO/checkpoint/Geo-vo
+maxepoch:
+    value: 60
+model:
+    value: Geo-vo
+num_cpu:
+    value: 4
+odometry_home:
+    value: /home/jnu-ie/Dataset/kitti_odometry/
+poses_subdir:
+    value: data_odometry_poses/dataset/poses/
+proj_home:
+    value: /home/jnu-ie/kys/GEO-VO/
+trainsequencelist:
+    value:
+        - "00"
+        - "01"
+        - "02"
+        - "03"
+        - "04"
+        - "05"
+        - "06"
+        - "07"
+        - "08"
+valsequencelist:
+    value:
+        - "09"
+        - "10"
