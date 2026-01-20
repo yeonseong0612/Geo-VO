@@ -221,8 +221,14 @@ class DBASolver(nn.Module):
         g_eff = g_p - (H_pd_invHdd * g_d.unsqueeze(-1)).sum(dim=1)
 
         # 4. Solve
-        delta_pose = torch.linalg.solve(H_eff, g_eff) # [B, 6, 1]
-
+        eps = 1e-4
+        identity = torch.eye(H_eff.shape[-1], device=H_eff.device).expand_as(H_eff)
+        H_eff_stable = H_eff + eps * identity
+        try:
+            delta_pose = torch.linalg.solve(H_eff_stable, g_eff)
+        except torch._C._LinAlgError:
+            # 만약 그래도 에러가 난다면, 더 큰 댐핑을 주거나 0으로 처리하여 학습 중단을 방지합니다.
+            delta_pose = torch.zeros_like(g_eff)
         # 5. Back-substitution (Depth 업데이트 계산)
         # v = H_pd^T * delta_pose -> [B, N, 1, 6] * [B, 1, 6, 1] -> [B, N, 1, 1]
         v = torch.matmul(H_pd.transpose(-1, -2), delta_pose.unsqueeze(1)).squeeze(-1)
