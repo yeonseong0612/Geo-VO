@@ -22,26 +22,17 @@ class SuperPointExtractor:
         
         kpts = out["keypoints"]          
         desc = out["descriptors"]         
-        fixed_n = 1000
-        new_kpts = []
-        new_desc = []
+        
+        fixed_n = 800 
+        final_kpts = []
+        final_desc = []
 
         for k, d in zip(kpts, desc):
-            # k의 크기가 [N, 2], d의 크기가 [N, C]라고 가정
             num_k = k.shape[0]
-            if num_k >= fixed_n:
-                new_kpts.append(k[:fixed_n])
-                new_desc.append(d[:fixed_n])
-            else:
-                # 모자라면 마지막 값을 복사하거나 제로 패딩 (모델 설계에 따라 다름)
-                padding_k = torch.zeros((fixed_n - num_k, 2), device=k.device)
-                padding_d = torch.zeros((fixed_n - num_k, d.shape[1]), device=d.device)
-                new_kpts.append(torch.cat([k, padding_k], dim=0))
-                new_desc.append(torch.cat([d, padding_d], dim=0))
+            keep_n = min(num_k, fixed_n)
+            
+            final_kpts.append(k[:keep_n])
+            final_desc.append(d[:keep_n])
 
-        kpts = torch.stack(new_kpts)
-        desc = torch.stack(new_desc)
 
-        desc = desc.transpose(1, 2)
-
-        return kpts, desc
+        return final_kpts, final_desc
