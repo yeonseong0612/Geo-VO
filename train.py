@@ -44,7 +44,7 @@ def train(rank, world_size, cfg):
 
     model = VO(cfg).to(device)
     if is_ddp:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.MultiStepLR(

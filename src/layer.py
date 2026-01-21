@@ -32,65 +32,71 @@ class CorrBlock(nn.Module):
         corr_feat = torch.matmul(prob, fmap2)
 
         return corr_feat
-    
+
+
 class CyclicErrorModule(nn.Module):
-    def __init__(self, baseline, device):
+    def __init__(self, baseline):
         super().__init__()
-        # 1. 고정된 스테레오 변환을 미리 GPU에 생성 (딱 한 번만)
-        disp_vec = torch.tensor([baseline, 0, 0, 0, 0, 0, 1.0], device=device)
-        self.stereo_offset = SE3.InitFromVec(disp_vec).unsqueeze(0) # [1, 1]
-        self.stereo_inv = self.stereo_offset.inv()
-        
+        self.baseline = baseline
+        self.stereo_offset = None
+        self.stereo_inv = None
+
     def backproject(self, kpts, depth, intrinsics):
-        # [B, 1, 1] 형태로 차원 정리
-        fx, fy, cx, cy = intrinsics[:,0], intrinsics[:,1], intrinsics[:,2], intrinsics[:,3]
-        fx = fx.view(-1, 1, 1)
-        fy = fy.view(-1, 1, 1)
-        cx = cx.view(-1, 1, 1)
-        cy = cy.view(-1, 1, 1)
-
-        u, v = kpts[..., 0:1], kpts[..., 1:2]
-        
-        # depth가 [B, N]으로 들어올 경우를 대비해 안전하게 unsqueeze
-        if depth.dim() == 2:
-            depth = depth.unsqueeze(-1)
-
-        X = (u - cx) * depth / fx
-        Y = (v - cy) * depth / fy
-        Z = depth
-        return torch.cat([X, Y, Z], dim=-1)
+        """[B, N, 2], [B, N, 1], [B, 4] -> [B, N, 3]"""
+        fx, fy, cx, cy = intrinsics.split(1, dim=-1)
+        z = depth
+        x = (kpts[..., 0:1] - cx.unsqueeze(1)) * z / fx.unsqueeze(1)
+        y = (kpts[..., 1:2] - cy.unsqueeze(1)) * z / fy.unsqueeze(1)
+        return torch.cat([x, y, z], dim=-1)
 
     def project(self, pts_3d, intrinsics):
-        fx, fy, cx, cy = intrinsics[:,0], intrinsics[:,1], intrinsics[:,2], intrinsics[:,3]
-        fx = fx.view(-1, 1, 1)
-        fy = fy.view(-1, 1, 1)
-        cx = cx.view(-1, 1, 1)
-        cy = cy.view(-1, 1, 1)
+        """[B, N, 3], [B, 4] -> [B, N, 2]"""
+        fx, fy, cx, cy = intrinsics.split(1, dim=-1)
+        x, y, z = pts_3d.split(1, dim=-1)
+        # 0 나누기 방지 (epsilon)
+        z = torch.clamp(z, min=1e-3)
+        px = fx.unsqueeze(1) * (x / z) + cx.unsqueeze(1)
+        py = fy.unsqueeze(1) * (y / z) + cy.unsqueeze(1)
+        return torch.cat([px, py], dim=-1)
 
-        X, Y, Z = pts_3d[..., 0:1], pts_3d[..., 1:2], pts_3d[..., 2:3]
-        Z = Z + 1e-8
+    def forward(self, kpts, depth, poses, intrinsics):
+        device = kpts.device
+        
+        # 1. 스테레오 오프셋 초기화
+        if self.stereo_offset is None or self.stereo_offset.device != device:
+            disp_vec = torch.tensor([self.baseline, 0, 0, 0, 0, 0, 1.0], device=device)
+            raw_se3 = SE3.InitFromVec(disp_vec) 
+            
+            # [수정] unsqueeze 대신 view를 사용하되, 인자를 반드시 '튜플'로 전달
+            # 이렇게 하면 lietorch 내부의 '리스트 + 튜플' 에러를 피할 수 있습니다.
+            self.stereo_offset = raw_se3.view((1, 1)) 
+            self.stereo_inv = self.stereo_offset.inv()
 
-        u = fx * (X / Z) + cx
-        v = fy * (Y / Z) + cy
-        return torch.cat([u, v], dim=-1)
+        # 1. 역투영 (Unprojection)
+        pts_3d_Lt = self.backproject(kpts, depth, intrinsics) # [B, N, 3]
 
-    def forward(self, kpts_Lt, depth_Lt, rel_pose, intrinsics):
-        # 2. rel_pose가 [B]라면 [B, 1]로 확장하여 N개의 점에 대해 브로드캐스팅 준비
-        if len(rel_pose.data.shape) == 2:
-            rel_pose = rel_pose[:, None]
+        # 2. SE3 객체들의 차원 맞추기 (AssertionError 방지 핵심)
+        # poses가 [B] 형태라면 view나 unsqueeze로 [B, 1]로 만듭니다.
+        # lietorch SE3 객체는 .view()를 사용합니다.
+        curr_poses = poses.view((poses.shape[0], 1)) # [B, 1]
+        
+        # stereo_offset은 이미 위에서 [1, 1]로 만드셨을 겁니다.
+        # 만약 에러가 난다면 이 녀석도 체크가 필요합니다.
 
-        # 3. 모든 연산은 GPU 커널에서 텐서 단위로 병렬 처리됨
-        pts_3d_Lt = self.backproject(kpts_Lt, depth_Lt, intrinsics) # [B, N, 3]
-
-        # Cycle: Lt -> Rt -> Rt1 -> Lt1 -> Lt_final
-        # 아래 act() 연산들은 lietorch의 최적화된 CUDA 커널을 사용합니다.
+        # 3. Cycle 연산 수행
+        # [1, 1] act [B, N, 3] -> [B, N, 3]
         pts_3d_Rt = self.stereo_offset.act(pts_3d_Lt)
-        pts_3d_Rt1 = rel_pose.act(pts_3d_Rt)
+        
+        # [B, 1] act [B, N, 3] -> [B, N, 3] (이제 여기서 에러가 안 납니다!)
+        pts_3d_Rt1 = curr_poses.act(pts_3d_Rt)
+        
+        # Lt1 방향으로 돌아오는 연산들도 동일하게 적용
         pts_3d_Lt1 = self.stereo_inv.act(pts_3d_Rt1)
-        pts_3d_Lt_final = rel_pose.inv().act(pts_3d_Lt1)
+        pts_3d_Lt_final = curr_poses.inv().act(pts_3d_Lt1)
 
+        # 4. 재투영 (Projection)
         kpts_Lt_final = self.project(pts_3d_Lt_final, intrinsics)
-        return kpts_Lt_final - kpts_Lt
+        return kpts_Lt_final - kpts
     
 class UpdateBlock(nn.Module):
     def __init__(self, hidden_dim = 256):
@@ -126,21 +132,22 @@ class UpdateBlock(nn.Module):
             nn.Softplus()
         )
 
-    def forward(self, h, c_temp, c_stereo, e_proj, c_geo):
-        x = torch.cat([c_temp, c_stereo, e_proj, c_geo], dim=-1) # [B, N, 769]
+    def forward(self, h, c_temp, c_stereo, e_proj, f_Lt, edges=None, edge_attr=None):
+        
+        # 기존 c_geo 대신 f_Lt를 사용하여 concat
+        x = torch.cat([c_temp, c_stereo, e_proj, f_Lt], dim=-1) # [B, N, D]
+        
         if x.dim() == 3:
             B, N, _ = x.shape
         else:
-            # 만약 2차원 [N, 769]로 들어왔다면 B=1로 간주
             B = 1
             N, _ = x.shape
-            # 연산을 위해 3차원으로 강제 확장 [1, N, D]
             x = x.unsqueeze(0)
             h = h.unsqueeze(0)
 
         D_h = h.shape[-1]
 
-        # 3. Flatten 연산 (GRU는 2D를 원함)
+        # 3. Flatten 연산 (GRU 입력용)
         x_flat = x.view(B * N, -1)
         h_flat = h.view(B * N, -1)
 

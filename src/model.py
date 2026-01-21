@@ -7,13 +7,13 @@ from utils.DBA_utils import *
 
 
 class VO(nn.Module):
-    def __init__(self, baseline=0.54):
+    def __init__(self, cfg):
         super().__init__()
         self.extractor = SuperPointExtractor()
         self.DT = compute_delaunay_edges
         self.GAT = GeometricGAT(in_channels=258, out_channels=256)
         self.corr_block = CorrBlock()
-        self.cyclic_module = CyclicErrorModule(baseline)
+        self.cyclic_module = CyclicErrorModule(cfg.baseline)       
         self.update_block = UpdateBlock(hidden_dim=256)
         self.init_depth_net = nn.Linear(256, 1)
         self.DBA = DBASolver()
@@ -87,13 +87,22 @@ class VO(nn.Module):
         curr_depth = torch.ones((B, N, 1), device=device) * 5.0
         h = torch.zeros((B, N, 256), device=device)
 
+        poses_history = []
+        weights_history = []
+        errors_history = []
+
         for i in range(iters):
             e_proj = self.cyclic_module(kpts_Lt, curr_depth, curr_pose, calib)
-            
             h, r, w, a_p, a_d = self.update_block(h, c_temp, c_stereo, e_proj, f_Lt, edges, edge_attr) 
-            
             J_p, J_d = compute_projection_jacobian(kpts_Lt, curr_depth, calib)
             delta_pose_dba, delta_depth_dba = self.DBA(r, w, J_p, J_d, self.lmbda)
             curr_pose, curr_depth = self.DBA_Updater(curr_pose, curr_depth, delta_pose_dba, delta_depth_dba, a_p, a_d)
 
-        return curr_pose, curr_depth
+            poses_history.append(curr_pose)
+            weights_history.append(w)
+            errors_history.append(e_proj)
+
+        poses_h = SE3(torch.stack([p.data for p in poses_history]))
+        weights_h = torch.stack(weights_history) 
+        errors_h = torch.stack(errors_history) 
+        return (poses_h, weights_h, errors_h)

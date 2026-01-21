@@ -39,7 +39,7 @@ class DataFactory(data.Dataset):
                     self.datalist.append((parts[0], int(parts[1])))
 
         self.posesdict = {}
-        self.clib = {}
+        self.calib = {}
         
         for seq in seq_list:
             pose_path = os.path.join(cfg.odometry_home, cfg.poses_subdir, f"{seq}.txt")
@@ -52,7 +52,7 @@ class DataFactory(data.Dataset):
             if os.path.exists(calib_path):
                 calibdata = read_calib_file(calib_path)
                 P2 = np.reshape(calibdata['P2'], (3, 4))
-                self.clib[seq] = np.array([P2[0, 0], P2[1, 1], P2[0, 2], P2[1, 2]], dtype=np.float32) # [fx, fy, cx, cy]
+                self.calib[seq] = np.array([P2[0, 0], P2[1, 1], P2[0, 2], P2[1, 2]], dtype=np.float32) # [fx, fy, cx, cy]
 
     def __len__(self):
         return len(self.datalist)
@@ -71,7 +71,7 @@ class DataFactory(data.Dataset):
 
         data = {
             'rel_pose' : rel_pose,
-            'clib' : torch.from_numpy(self.clib[seq]),
+            'calib' : torch.from_numpy(self.calib[seq]),
             'seq' : seq,
             'imgnum' : imgnum
         }
@@ -119,37 +119,49 @@ import torch.nn.functional as F
 
 def vo_collate_fn(batch):
     rel_poses = torch.stack([item['rel_pose'] for item in batch])
-    clibs = torch.stack([item['clib'] for item in batch])
+    calibs = torch.stack([item['calib'] for item in batch])
     seqs = [item['seq'] for item in batch]
     imgnums = [item['imgnum'] for item in batch]
+
+    MAX_KPT = 800 
 
     if 'precomputed' in batch[0]:
         all_node_features = []
         all_edges = []
         all_edge_attrs = []
-        all_kpts = []
+        all_kpts_fixed = [] # 고정 크기 리스트
         
         node_offset = 0
         
         for item in batch:
             for s in item['precomputed']:
-                curr_n = s['node_features'].shape[0] 
+                k = s['kpts'] # [N, 2]
+                f = s['node_features'] # [N, 258]
                 
-                all_node_features.append(s['node_features'])
-                all_kpts.append(s['kpts'])
-                
+                num_k = k.shape[0]
+                if num_k > MAX_KPT:
+                    k = k[:MAX_KPT]
+                    f = f[:MAX_KPT]
+                elif num_k < MAX_KPT:
+                    k_pad = torch.zeros((MAX_KPT - num_k, 2), device=k.device)
+                    f_pad = torch.zeros((MAX_KPT - num_k, 258), device=f.device)
+                    k = torch.cat([k, k_pad], dim=0)
+                    f = torch.cat([f, f_pad], dim=0)
+
+                all_kpts_fixed.append(k)
+                all_node_features.append(f)
+
                 all_edges.append(s['edges'] + node_offset)
                 all_edge_attrs.append(s['edge_attr'])
-                
-                node_offset += curr_n
+                node_offset += MAX_KPT 
 
         return {
-            'rel_pose': rel_poses,          # [B, 7]
-            'clib': clibs,                  # [B, 4]
-            'node_features': torch.cat(all_node_features, dim=0), 
-            'edges': torch.cat(all_edges, dim=1),                 
-            'edge_attr': torch.cat(all_edge_attrs, dim=0),        
-            'kpts': torch.cat(all_kpts, dim=0),                   
+            'rel_pose': rel_poses,
+            'calib': calibs,
+            'node_features': torch.stack(all_node_features), # [B*4, MAX_KPT, 258]
+            'edges': torch.cat(all_edges, dim=1),
+            'edge_attr': torch.cat(all_edge_attrs, dim=0),
+            'kpts': torch.stack(all_kpts_fixed).view(len(batch), 4, MAX_KPT, 2),
             'seq': seqs,
             'imgnum': imgnums
         }
@@ -159,7 +171,7 @@ def vo_collate_fn(batch):
         return {
             'images': images,
             'rel_pose': rel_poses,
-            'clib': clibs,
+            'calib': calibs,
             'seq': seqs,
             'imgnum': imgnums
         }
