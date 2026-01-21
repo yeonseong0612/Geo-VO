@@ -14,7 +14,7 @@ class VO(nn.Module):
         self.GAT = GeometricGAT(in_channels=258, out_channels=256)
         self.corr_block = CorrBlock()
         self.cyclic_module = CyclicErrorModule(cfg.baseline)       
-        self.update_block = UpdateBlock(hidden_dim=256)
+        self.update_block = GraphUpdateBlock(hidden_dim=256)
         self.init_depth_net = nn.Linear(256, 1)
         self.DBA = DBASolver()
         self.DBA_Updater = PoseDepthUpdater()
