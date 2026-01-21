@@ -50,6 +50,6 @@ def total_loss(outputs, gt_pose):
     l_pose = pose_geodesic_loss(poses_h, gt_pose, gamma=0.8)
     l_weight = weight_reg_loss(weights_h, errors_h, gamma=0.8)
     
-    t_loss = l_pose + 0.01 * l_weight
+    t_loss = l_pose + 0.05 * l_weight
     
     return t_loss, l_pose.detach(), l_weight.detach()
