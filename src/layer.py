@@ -34,13 +34,13 @@ class CorrBlock(nn.Module):
         return corr_feat
     
 class CyclicErrorModule(nn.Module):
-    def __init__(self, baseline):
+    def __init__(self, baseline, device):
         super().__init__()
-        # 정면 기준 오른쪽 카메라로의 이동 (Baseline만큼 X축 이동)
-        # KITTI는 보통 왼쪽(Cam2)이 기준이므로 오른쪽(Cam3)은 X축으로 +Baseline 이동
-        disp_vec = torch.tensor([baseline, 0, 0, 0, 0, 0, 1.0], dtype=torch.float32)
-        self.register_buffer('stereo_offset_vec', disp_vec.unsqueeze(0))
-
+        # 1. 고정된 스테레오 변환을 미리 GPU에 생성 (딱 한 번만)
+        disp_vec = torch.tensor([baseline, 0, 0, 0, 0, 0, 1.0], device=device)
+        self.stereo_offset = SE3.InitFromVec(disp_vec).unsqueeze(0) # [1, 1]
+        self.stereo_inv = self.stereo_offset.inv()
+        
     def backproject(self, kpts, depth, intrinsics):
         # [B, 1, 1] 형태로 차원 정리
         fx, fy, cx, cy = intrinsics[:,0], intrinsics[:,1], intrinsics[:,2], intrinsics[:,3]
@@ -75,33 +75,22 @@ class CyclicErrorModule(nn.Module):
         return torch.cat([u, v], dim=-1)
 
     def forward(self, kpts_Lt, depth_Lt, rel_pose, intrinsics):
-        B = kpts_Lt.shape[0]
-        
-        # 1. 스테레오 오프셋 생성 및 차원 확장 [B, 1, 7]
-        # .unsqueeze(1) 대신 [:, None] 또는 [..., None]을 사용합니다.
-        stereo_vec = self.stereo_offset_vec.repeat(B, 1)
-        stereo_offset = SE3.InitFromVec(stereo_vec)[:, None] 
-        
-        # 2. rel_pose 차원 확장 [B, 1, 7]
-        # SE3 객체에 직접 인덱싱을 하면 내부 data 텐서의 차원이 확장된 새 객체가 반환됩니다.
+        # 2. rel_pose가 [B]라면 [B, 1]로 확장하여 N개의 점에 대해 브로드캐스팅 준비
         if len(rel_pose.data.shape) == 2:
             rel_pose = rel_pose[:, None]
 
-        # 3. Backproject (pts_3d_Lt: [B, N, 3])
-        pts_3d_Lt = self.backproject(kpts_Lt, depth_Lt, intrinsics)
+        # 3. 모든 연산은 GPU 커널에서 텐서 단위로 병렬 처리됨
+        pts_3d_Lt = self.backproject(kpts_Lt, depth_Lt, intrinsics) # [B, N, 3]
 
-        # 4. Cycle Transformation
-        # 이제 모두 3차원 텐서 구조(B, N, 3)와 (B, 1, 7)로 맞춰졌습니다.
-        pts_3d_Rt = stereo_offset.act(pts_3d_Lt)
+        # Cycle: Lt -> Rt -> Rt1 -> Lt1 -> Lt_final
+        # 아래 act() 연산들은 lietorch의 최적화된 CUDA 커널을 사용합니다.
+        pts_3d_Rt = self.stereo_offset.act(pts_3d_Lt)
         pts_3d_Rt1 = rel_pose.act(pts_3d_Rt)
-        pts_3d_Lt1 = stereo_offset.inv().act(pts_3d_Rt1)
+        pts_3d_Lt1 = self.stereo_inv.act(pts_3d_Rt1)
         pts_3d_Lt_final = rel_pose.inv().act(pts_3d_Lt1)
 
-        # 5. Project & Error
         kpts_Lt_final = self.project(pts_3d_Lt_final, intrinsics)
-        cycle_error_2d = kpts_Lt_final - kpts_Lt 
-
-        return cycle_error_2d
+        return kpts_Lt_final - kpts_Lt
     
 class UpdateBlock(nn.Module):
     def __init__(self, hidden_dim = 256):
@@ -112,19 +101,7 @@ class UpdateBlock(nn.Module):
             nn.Linear(512, hidden_dim),
             nn.ReLU()
         )
-
         self.gru = nn.GRUCell(input_size=hidden_dim, hidden_size=hidden_dim)
-
-        # self.pose_gate = nn.Sequential(
-        #     nn.Linear(hidden_dim, 128),
-        #     nn.ReLU(),
-        #     nn.Linear(128,6)
-        # )
-        # self.depth_gate = nn.Sequential(
-        #     nn.Linear(hidden_dim, 128),
-        #     nn.ReLU(),
-        #     nn.Linear(128,1)
-        # )
         self.residual_head = nn.Sequential(
             nn.Linear(hidden_dim, 256),
             nn.ReLU(),
@@ -136,14 +113,12 @@ class UpdateBlock(nn.Module):
             nn.Linear(256, 2),
             nn.Sigmoid()
         )
-
         self.alpha_pose_head = nn.Sequential(
             nn.Linear(hidden_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
             nn.Softplus() 
         )
-
         self.alpha_depth_head = nn.Sequential(
             nn.Linear(hidden_dim, 128),
             nn.ReLU(),
@@ -152,13 +127,7 @@ class UpdateBlock(nn.Module):
         )
 
     def forward(self, h, c_temp, c_stereo, e_proj, c_geo):
-        # 디버깅용: 각 입력의 차원을 출력해봅니다 (나중에 삭제)
-        # print(f"c_temp: {c_temp.shape}, c_stereo: {c_stereo.shape}, e_proj: {e_proj.shape}, c_geo: {c_geo.shape}")
-
-        # 1. 모든 입력의 마지막 차원을 기준으로 합칩니다.
-        # e_proj가 [B, N, 1]인지 꼭 확인해야 합니다.
         x = torch.cat([c_temp, c_stereo, e_proj, c_geo], dim=-1) # [B, N, 769]
-        
         if x.dim() == 3:
             B, N, _ = x.shape
         else:
@@ -205,32 +174,24 @@ class DBASolver(nn.Module):
         g_p = torch.matmul(J_p.transpose(-1, -2), W * r.unsqueeze(-1)).sum(dim=1) # [B, 6, 1]
         g_d = torch.matmul(J_d.transpose(-1, -2), W * r.unsqueeze(-1)).squeeze(-1) # [B, N, 1]
 
-        # 2. Damping
         B = H_pp.shape[0]
         H_pp = H_pp + lmbda * torch.eye(6, device=H_pp.device).unsqueeze(0)
         H_dd = H_dd + lmbda
 
-        # 3. Schur Complement (RCS 구성)
-        inv_H_dd = 1.0 / (H_dd + 1e-8) # [B, N, 1]
+        inv_H_dd = 1.0 / torch.clamp(H_dd, min=1e-6) # [B, N, 1]
         H_pd_invHdd = H_pd * inv_H_dd.unsqueeze(-1) # [B, N, 6, 1]
 
-        # H_eff 계산: matmul( [B, N, 6, 1], [B, N, 1, 6] ) -> [B, N, 6, 6]
         H_eff = H_pp - torch.matmul(H_pd_invHdd, H_pd.transpose(-1, -2)).sum(dim=1)
-        
-        # g_eff 계산: [B, N, 6, 1] * [B, N, 1, 1] -> [B, N, 6, 1]
+        H_eff = 0.5 * (H_eff + H_eff.transpose(-1, -2))
         g_eff = g_p - (H_pd_invHdd * g_d.unsqueeze(-1)).sum(dim=1)
 
-        # 4. Solve
         eps = 1e-4
         identity = torch.eye(H_eff.shape[-1], device=H_eff.device).expand_as(H_eff)
         H_eff_stable = H_eff + eps * identity
         try:
             delta_pose = torch.linalg.solve(H_eff_stable, g_eff)
         except torch._C._LinAlgError:
-            # 만약 그래도 에러가 난다면, 더 큰 댐핑을 주거나 0으로 처리하여 학습 중단을 방지합니다.
             delta_pose = torch.zeros_like(g_eff)
-        # 5. Back-substitution (Depth 업데이트 계산)
-        # v = H_pd^T * delta_pose -> [B, N, 1, 6] * [B, 1, 6, 1] -> [B, N, 1, 1]
         v = torch.matmul(H_pd.transpose(-1, -2), delta_pose.unsqueeze(1)).squeeze(-1)
         delta_depth = inv_H_dd * (g_d - v)
 
@@ -243,6 +204,7 @@ class PoseDepthUpdater(nn.Module):
     def forward(self, curr_pose, curr_depth, delta_pose, delta_depth, a_p, a_d):
         B = curr_pose.shape[0]
         new_depth = curr_depth + a_d * delta_depth
+        new_depth = torch.clamp(new_depth, min=0.1)
 
         scaled_delta = a_p * delta_pose
 
@@ -250,3 +212,43 @@ class PoseDepthUpdater(nn.Module):
         new_pose = delta_SE3 * curr_pose
 
         return new_pose, new_depth
+    
+
+class GraphUpdateBlock(nn.Module):
+    def __init__(self, hidden_dim=256):
+        super().__init__()
+        self.spatial_gat = GeometricGAT(in_channels=770, out_channels=hidden_dim)
+        self.gru = nn.GRUCell(input_size=hidden_dim, hidden_size=hidden_dim)
+        self.residual_head = nn.Sequential(
+            nn.Linear(hidden_dim, 256), nn.ReLU(), nn.Linear(256, 2)
+        )
+        self.weight_head = nn.Sequential(
+            nn.Linear(hidden_dim, 256), nn.ReLU(), nn.Linear(256, 2), nn.Sigmoid()
+        )
+        self.alpha_pose_head = nn.Sequential(
+            nn.Linear(hidden_dim, 128), nn.ReLU(), nn.Linear(128, 1), nn.Softplus()
+        )
+        self.alpha_depth_head = nn.Sequential(
+            nn.Linear(hidden_dim, 128), nn.ReLU(), nn.Linear(128, 1), nn.Softplus()
+        )
+
+    def forward(self, h, c_temp, c_stereo, e_proj, f_Lt, edges, edge_attr):
+        B, N, _ = f_Lt.shape
+        
+
+        x = torch.cat([c_temp, c_stereo, e_proj, f_Lt], dim=-1) 
+        
+        x_flat = x.view(-1, x.shape[-1])
+        x_spatial, _ = self.spatial_gat(x_flat, edges, edge_attr)
+        
+        h_flat = h.view(-1, h.shape[-1])
+        h_new_flat = self.gru(x_spatial, h_flat)
+        h_new = h_new_flat.view(B, N, -1)
+        
+        r = self.residual_head(h_new)
+        w = self.weight_head(h_new)
+        
+        a_p = self.alpha_pose_head(h_new).mean(dim=1) 
+        a_d = self.alpha_depth_head(h_new) 
+
+        return h_new, r, w, a_p, a_d
