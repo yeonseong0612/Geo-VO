@@ -258,22 +258,24 @@ class GraphUpdateBlock(nn.Module):
         )
 
     def forward(self, h, c_temp, c_stereo, e_proj, f_Lt, edges, edge_attr):
-        B, N, _ = f_Lt.shape
+        # f_Lt: [Total_N, D] (이제 2차원으로 들어옴)
         
-
-        x = torch.cat([c_temp, c_stereo, e_proj, f_Lt], dim=-1) 
+        # 1. 모든 특징 결합
+        x = torch.cat([c_temp, c_stereo, e_proj, f_Lt], dim=-1) # [Total_N, 770]
+        if x.dim() == 3:
+            x = x.view(-1, x.shape[-1])
         
-        x_flat = x.view(-1, x.shape[-1])
-        x_spatial, _ = self.spatial_gat(x_flat, edges, edge_attr)
+        # 2. GAT 연산 (x_flat 과정 필요 없음)
+        x_spatial, _ = self.spatial_gat(x, edges, edge_attr)
         
-        h_flat = h.view(-1, h.shape[-1])
-        h_new_flat = self.gru(x_spatial, h_flat)
-        h_new = h_new_flat.view(B, N, -1)
+        # 3. GRU 업데이트 (h도 [Total_N, D] 여야 함)
+        h_new = self.gru(x_spatial, h)
         
+        # 4. Heads 연산
         r = self.residual_head(h_new)
         w = self.weight_head(h_new)
         
-        a_p = self.alpha_pose_head(h_new).mean(dim=1) 
+        a_p = self.alpha_pose_head(h_new) 
         a_d = self.alpha_depth_head(h_new) 
 
         return h_new, r, w, a_p, a_d

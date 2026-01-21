@@ -123,49 +123,43 @@ def vo_collate_fn(batch):
     seqs = [item['seq'] for item in batch]
     imgnums = [item['imgnum'] for item in batch]
 
-    MAX_KPT = 800 
-
     if 'precomputed' in batch[0]:
         all_node_features = []
         all_edges = []
         all_edge_attrs = []
-        all_kpts_fixed = [] # 고정 크기 리스트
+        all_kpts = []
+        all_b_idx = [] # 각 점이 어떤 배치(샘플)에 속하는지 추적하기 위함
         
         node_offset = 0
-        
-        for item in batch:
-            for s in item['precomputed']:
-                k = s['kpts'] # [N, 2]
-                f = s['node_features'] # [N, 258]
+        for b_idx, item in enumerate(batch):
+            # item['precomputed'] 안에는 [Lt, Rt, Lt1, Rt1] 4개가 있음
+            for v_idx, s in enumerate(item['precomputed']):
+                curr_n = s['node_features'].shape[0]
                 
-                num_k = k.shape[0]
-                if num_k > MAX_KPT:
-                    k = k[:MAX_KPT]
-                    f = f[:MAX_KPT]
-                elif num_k < MAX_KPT:
-                    k_pad = torch.zeros((MAX_KPT - num_k, 2), device=k.device)
-                    f_pad = torch.zeros((MAX_KPT - num_k, 258), device=f.device)
-                    k = torch.cat([k, k_pad], dim=0)
-                    f = torch.cat([f, f_pad], dim=0)
-
-                all_kpts_fixed.append(k)
-                all_node_features.append(f)
-
+                all_node_features.append(s['node_features'])
+                all_kpts.append(s['kpts'])
+                
+                # 엣지 오프셋 적용: 실제 누적 노드 수만큼 정확히 더함
                 all_edges.append(s['edges'] + node_offset)
                 all_edge_attrs.append(s['edge_attr'])
-                node_offset += MAX_KPT 
+                
+                # 배치 인덱스 기록 (나중에 view(-1) 해제할 때 필요)
+                # (batch_index, view_index) 정보를 담음
+                all_b_idx.append(torch.full((curr_n,), b_idx, dtype=torch.long))
+                
+                node_offset += curr_n
 
         return {
             'rel_pose': rel_poses,
             'calib': calibs,
-            'node_features': torch.stack(all_node_features), # [B*4, MAX_KPT, 258]
-            'edges': torch.cat(all_edges, dim=1),
-            'edge_attr': torch.cat(all_edge_attrs, dim=0),
-            'kpts': torch.stack(all_kpts_fixed).view(len(batch), 4, MAX_KPT, 2),
+            'node_features': torch.cat(all_node_features, dim=0), # [Total_N, 258]
+            'edges': torch.cat(all_edges, dim=1),                 # [2, Total_E]
+            'edge_attr': torch.cat(all_edge_attrs, dim=0),        # [Total_E, 1]
+            'kpts': torch.cat(all_kpts, dim=0),                   # [Total_N, 2]
+            'batch_idx': torch.cat(all_b_idx, dim=0),             # [Total_N]
             'seq': seqs,
             'imgnum': imgnums
         }
-    
     else:
         images = torch.stack([item['images'] for item in batch]) 
         return {
