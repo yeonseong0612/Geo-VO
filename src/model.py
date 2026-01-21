@@ -27,9 +27,9 @@ class VO(nn.Module):
 
         # --- feature and descriptor ---
         if self.training:
-            node_feats = batch['node_features'].to(device)
-            edges = batch['edges'].to(device)
-            edge_attr = batch['edge_attr'].to(device)
+            node_feats = batch['node_features'].to(device)  # [B, 3, 256+2(uv)]
+            edges = batch['edges'].to(device) # [B, N]
+            edge_attr = batch['edge_attr'].to(device) # []
             kpts_all = batch['kpts'].to(device)
 
             BN = node_feats.shape[0]

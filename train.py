@@ -76,7 +76,7 @@ def train(rank, world_size, cfg):
             loss, l_p, l_w = total_loss(outputs, gt_pose)
             
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             epoch_loss += loss.item()

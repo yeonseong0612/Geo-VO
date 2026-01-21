@@ -10,11 +10,11 @@ class GeometricGAT(nn.Module):
                                heads=heads, edge_dim=1)
         self.conv2 = GATv2Conv(hidden_channels, out_channels, 
                                heads=heads, edge_dim=1, concat=False)
-        self.relu = nn.ReLU()
+        self.SiLU = nn.SiLU()
 
     def forward(self, x, edge_index, edge_attr):
         x = self.conv1(x, edge_index, edge_attr)
-        x = self.relu(x)
+        x = self.SiLU(x)
         x, (edge_index, alpha) = self.conv2(x, edge_index, edge_attr, return_attention_weights=True)
         
         return x, alpha
@@ -103,33 +103,33 @@ class UpdateBlock(nn.Module):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(770, 512),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(512, hidden_dim),
-            nn.ReLU()
+            nn.SiLU()
         )
         self.gru = nn.GRUCell(input_size=hidden_dim, hidden_size=hidden_dim)
         self.residual_head = nn.Sequential(
             nn.Linear(hidden_dim, 256),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(256, 2)
         )
         self.weight_head = nn.Sequential(
             nn.Linear(hidden_dim, 256),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(256, 2),
             nn.Sigmoid()
         )
         self.alpha_pose_head = nn.Sequential(
             nn.Linear(hidden_dim, 128),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(128, 1),
-            nn.Softplus() 
+            nn.Sigmoid() 
         )
         self.alpha_depth_head = nn.Sequential(
             nn.Linear(hidden_dim, 128),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(128, 1),
-            nn.Softplus()
+            nn.Sigmoid()
         )
 
     def forward(self, h, c_temp, c_stereo, e_proj, f_Lt, edges=None, edge_attr=None):
@@ -165,40 +165,58 @@ class UpdateBlock(nn.Module):
         a_d = self.alpha_depth_head(h) 
 
         return h, r, w, a_p, a_d
-
 class DBASolver(nn.Module):
     def __init__(self):
         super().__init__()
 
     def forward(self, r, w, J_p, J_d, lmbda):
-        W = w.unsqueeze(-1) # [B, N, 2, 1]
+        # w: [B, N, 2], r: [B, N, 2], J_p: [B, N, 2, 6], J_d: [B, N, 2, 1]
+        W = w.unsqueeze(-1) # [B, N, 2, 1] (Weighting mask)
 
-        # 1. Hessian & Gradient 블록
+        # 1. Hessian & Gradient 블록 계산
+        # 안정성을 위해 연산 전 단계에서 아주 작은 값(eps)을 고려합니다.
+        eps_stable = 1e-7
+        
         H_pp = torch.matmul(J_p.transpose(-1, -2), W * J_p).sum(dim=1) # [B, 6, 6]
         H_pd = torch.matmul(J_p.transpose(-1, -2), W * J_d)           # [B, N, 6, 1]
         H_dd = torch.matmul(J_d.transpose(-1, -2), W * J_d).squeeze(-1) # [B, N, 1]
 
-        g_p = torch.matmul(J_p.transpose(-1, -2), W * r.unsqueeze(-1)).sum(dim=1) # [B, 6, 1]
+        g_p = torch.matmul(J_p.transpose(-1, -2), W * r.unsqueeze(-1)).sum(dim=1)  # [B, 6, 1]
         g_d = torch.matmul(J_d.transpose(-1, -2), W * r.unsqueeze(-1)).squeeze(-1) # [B, N, 1]
 
-        B = H_pp.shape[0]
-        H_pp = H_pp + lmbda * torch.eye(6, device=H_pp.device).unsqueeze(0)
-        H_dd = H_dd + lmbda
+        # 2. Levenberg-Marquardt Damping (lmbda) 적용
+        # H_dd는 대각 성분이므로 lmbda를 더해 역수 연산 시 안정성을 확보합니다.
+        H_pp = H_pp + lmbda.view(-1, 1, 1) * torch.eye(6, device=H_pp.device)
+        H_dd = H_dd + lmbda.view(-1, 1, 1) + eps_stable
 
-        inv_H_dd = 1.0 / torch.clamp(H_dd, min=1e-6) # [B, N, 1]
+        # 3. Schur Complement를 이용한 차원 축소 연산
+        # inv_H_dd = 1 / H_dd
+        inv_H_dd = 1.0 / H_dd # [B, N, 1]
         H_pd_invHdd = H_pd * inv_H_dd.unsqueeze(-1) # [B, N, 6, 1]
 
+        # Reduced Camera Matrix (H_eff) 계산
         H_eff = H_pp - torch.matmul(H_pd_invHdd, H_pd.transpose(-1, -2)).sum(dim=1)
+        # 수치적 대칭성 강제 보정
         H_eff = 0.5 * (H_eff + H_eff.transpose(-1, -2))
+        
+        # g_eff 계산
         g_eff = g_p - (H_pd_invHdd * g_d.unsqueeze(-1)).sum(dim=1)
 
-        eps = 1e-4
-        identity = torch.eye(H_eff.shape[-1], device=H_eff.device).expand_as(H_eff)
-        H_eff_stable = H_eff + eps * identity
+        # 4. 선형 시스템 풀기 (H_eff * delta_pose = g_eff)
+        # H_eff가 여전히 불안정할 수 있으므로 작은 Ridge(eps)를 추가합니다.
+        eps_ridge = 1e-4
+        diag_idx = torch.arange(H_eff.shape[-1], device=H_eff.device)
+        H_eff[:, diag_idx, diag_idx] += eps_ridge
+        
         try:
-            delta_pose = torch.linalg.solve(H_eff_stable, g_eff)
+            # linalg.solve가 더 빠르고 안정적입니다.
+            delta_pose = torch.linalg.solve(H_eff, g_eff)
         except torch._C._LinAlgError:
+            # 행렬이 깨졌을 경우 업데이트를 포기하고 0을 반환 (NaN 확산 방지)
             delta_pose = torch.zeros_like(g_eff)
+
+        # 5. 최종 delta_depth 계산
+        # v = H_pd^T * delta_pose
         v = torch.matmul(H_pd.transpose(-1, -2), delta_pose.unsqueeze(1)).squeeze(-1)
         delta_depth = inv_H_dd * (g_d - v)
 
@@ -227,16 +245,16 @@ class GraphUpdateBlock(nn.Module):
         self.spatial_gat = GeometricGAT(in_channels=770, out_channels=hidden_dim)
         self.gru = nn.GRUCell(input_size=hidden_dim, hidden_size=hidden_dim)
         self.residual_head = nn.Sequential(
-            nn.Linear(hidden_dim, 256), nn.ReLU(), nn.Linear(256, 2)
+            nn.Linear(hidden_dim, 256), nn.SiLU(), nn.Linear(256, 2)
         )
         self.weight_head = nn.Sequential(
-            nn.Linear(hidden_dim, 256), nn.ReLU(), nn.Linear(256, 2), nn.Sigmoid()
+            nn.Linear(hidden_dim, 256), nn.SiLU(), nn.Linear(256, 2), nn.Sigmoid()
         )
         self.alpha_pose_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128), nn.ReLU(), nn.Linear(128, 1), nn.Softplus()
+            nn.Linear(hidden_dim, 128), nn.SiLU(), nn.Linear(128, 1), nn.Softplus()
         )
         self.alpha_depth_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128), nn.ReLU(), nn.Linear(128, 1), nn.Softplus()
+            nn.Linear(hidden_dim, 128), nn.SiLU(), nn.Linear(128, 1), nn.Softplus()
         )
 
     def forward(self, h, c_temp, c_stereo, e_proj, f_Lt, edges, edge_attr):
