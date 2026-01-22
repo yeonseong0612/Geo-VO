@@ -52,7 +52,7 @@ def verify_precomputed_data(file_path):
 if __name__ == "__main__":
     # 테스트하고 싶은 파일 경로 하나를 지정하세요
     # 예: 00번 시퀀스의 첫 번째 좌측 이미지 전처리 파일
-    SAMPLE_PATH = "/home/jnu-ie/kys/Geo-VO/geovo_prcomputed/00/image_2/000000.npz"
+    SAMPLE_PATH = "/home/jnu-ie/kys/Geo-VO/gendata/precomputed/00/image_2/000000.npz"
     
     verify_precomputed_data(SAMPLE_PATH)
 

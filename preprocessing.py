@@ -10,7 +10,15 @@ import torch.nn as nn
 from src.model import VO
 from CFG.vo_cfg import vo_cfg  
 
-# --- [1] 전처리 전용 데이터셋 클래스 ---
+import os
+import torch
+import numpy as np
+import cv2
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+import multiprocessing as mp
+
+# --- [1] 전처리 전용 데이터셋 클래스 (Crop 로직 적용) ---
 class PreprocessDataset(Dataset):
     def __init__(self, data_root, sequences):
         self.data_root = data_root
@@ -20,7 +28,6 @@ class PreprocessDataset(Dataset):
             img_dir = os.path.join(data_root, seq, 'image_2')
             if not os.path.exists(img_dir): continue
             
-            # 모든 프레임을 숫자 순서대로 정렬하여 수집
             img_names = sorted([f for f in os.listdir(img_dir) if f.endswith('.png')])
             
             for name in img_names:
@@ -37,19 +44,36 @@ class PreprocessDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        # BGR -> RGB 변환 및 Tensor화
-        img2 = cv2.imread(s['img_path_2'])
-        img3 = cv2.imread(s['img_path_3'])
+        img2_raw = cv2.imread(s['img_path_2'])
+        img3_raw = cv2.imread(s['img_path_3'])
         
-        img2 = torch.from_numpy(cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float() / 255.0
-        img3 = torch.from_numpy(cv2.cvtColor(img3, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float() / 255.0
+        imgs_processed = []
+        for raw_img in [img2_raw, img3_raw]:
+            # 1. BGR -> RGB 변환
+            img = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
+            H, W, _ = img.shape
+            
+            # 2. 원래 모델 크롭 로직: 32 배수 맞추기 및 가로 1216 제한
+            # H % 32를 통해 상단을 쳐냄
+            img = img[H % 32:, :1216]
+            
+            # 3. [중요] 시퀀스 간 미세한 세로 크기 차이 방지
+            # KITTI sequences 00-08은 보통 크롭 후 352 혹은 384가 되는데, 
+            # 배치를 묶기 위해 강제로 352로 맞춥니다. (대부분 352임)
+            if img.shape[0] != 352 or img.shape[1] != 1216:
+                img = cv2.resize(img, (1216, 352), interpolation=cv2.INTER_LINEAR)
+            
+            # 4. Tensor화 [H, W, C] -> [C, H, W]
+            imgs_processed.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
         
+        # 이제 모든 이미지가 (3, 352, 1216)이므로 stack 에러가 발생하지 않음
         return {
-            'images': torch.stack([img2, img3]), # [2, 3, H, W]
+            'images': torch.stack(imgs_processed), # [2, 3, 352, 1216]
             'seq': s['seq'],
             'imgnum': s['imgnum']
         }
 
+# --- [2] CPU 병렬 저장 워커 (기존 유지) ---
 def save_worker(task_data):
     try:
         from scipy.spatial import Delaunay
@@ -88,7 +112,6 @@ def save_worker(task_data):
     except Exception as e:
         print(f"Error saving {rel_path}: {e}")
 
-# ... (상단 임포트 및 PreprocessDataset 클래스 동일) ...
 
 @torch.no_grad()
 def export_parallel(model, dataloader, save_dir, num_cpu):
