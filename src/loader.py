@@ -115,57 +115,31 @@ class DataFactory(data.Dataset):
         return data
                 
 
-import torch.nn.functional as F
-
 def vo_collate_fn(batch):
     rel_poses = torch.stack([item['rel_pose'] for item in batch])
     calibs = torch.stack([item['calib'] for item in batch])
-    seqs = [item['seq'] for item in batch]
-    imgnums = [item['imgnum'] for item in batch]
 
-    if 'precomputed' in batch[0]:
-        all_node_features = []
-        all_edges = []
-        all_edge_attrs = []
-        all_kpts = []
-        all_b_idx = [] # 각 점이 어떤 배치(샘플)에 속하는지 추적하기 위함
-        
-        node_offset = 0
-        for b_idx, item in enumerate(batch):
-            # item['precomputed'] 안에는 [Lt, Rt, Lt1, Rt1] 4개가 있음
-            for v_idx, s in enumerate(item['precomputed']):
-                curr_n = s['node_features'].shape[0]
-                
-                all_node_features.append(s['node_features'])
-                all_kpts.append(s['kpts'])
-                
-                # 엣지 오프셋 적용: 실제 누적 노드 수만큼 정확히 더함
-                all_edges.append(s['edges'] + node_offset)
-                all_edge_attrs.append(s['edge_attr'])
-                
-                # 배치 인덱스 기록 (나중에 view(-1) 해제할 때 필요)
-                # (batch_index, view_index) 정보를 담음
-                all_b_idx.append(torch.full((curr_n,), b_idx, dtype=torch.long))
-                
-                node_offset += curr_n
+    all_node_features = []
+    all_edges = []
+    all_edge_attrs = []
+    all_kpts = []
+    
+    # 엣지 개수가 달라도 합칠 수 있도록 cat 방식을 사용하되, 
+    # 나중에 뷰별로 분리할 수 있게 구조를 유지합니다.
+    for item in batch:
+        for s in item['precomputed']:
+            all_node_features.append(s['node_features']) # [800, 256]
+            all_edges.append(s['edges'])                 # [2, E_i] -> 엣지 개수 다름
+            all_edge_attrs.append(s['edge_attr'])        # [E_i, 3]
+            all_kpts.append(s['kpts'])                   # [800, 2]
 
-        return {
-            'rel_pose': rel_poses,
-            'calib': calibs,
-            'node_features': torch.cat(all_node_features, dim=0), # [Total_N, 258]
-            'edges': torch.cat(all_edges, dim=1),                 # [2, Total_E]
-            'edge_attr': torch.cat(all_edge_attrs, dim=0),        # [Total_E, 1]
-            'kpts': torch.cat(all_kpts, dim=0),                   # [Total_N, 2]
-            'batch_idx': torch.cat(all_b_idx, dim=0),             # [Total_N]
-            'seq': seqs,
-            'imgnum': imgnums
-        }
-    else:
-        images = torch.stack([item['images'] for item in batch]) 
-        return {
-            'images': images,
-            'rel_pose': rel_poses,
-            'calib': calibs,
-            'seq': seqs,
-            'imgnum': imgnums
-        }
+    return {
+        'rel_pose': rel_poses,
+        'calib': calibs,
+        'node_features': torch.stack(all_node_features), # [B*4, 800, 256] (고정 크기이므로 stack 가능)
+        'edges': all_edges,                              # 리스트 형태로 유지 (개수가 다르므로)
+        'edge_attr': all_edge_attrs,                     # 리스트 형태로 유지
+        'kpts': torch.stack(all_kpts),                   # [B*4, 800, 2]
+        'seq': [item['seq'] for item in batch],
+        'imgnum': [item['imgnum'] for item in batch]
+    }

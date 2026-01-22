@@ -45,9 +45,7 @@ def train(rank, world_size, cfg):
     )
 
     model = VO(cfg).to(device)
-    if is_ddp:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-
+    
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=cfg.MultiStepLR_milstone, gamma=cfg.MultiStepLR_gamma
@@ -80,16 +78,23 @@ def train(rank, world_size, cfg):
         pbar = tqdm(loader, desc=f"Epoch {epoch}", disable=(rank != 0))
         
         for i, batch in enumerate(pbar):
+            if isinstance(batch['edges'], list):
+                # 리스트인 경우 각 요소 중 가장 큰 값을 찾음
+                max_node_idx = max([e.max().item() for e in batch['edges']])
+            else:
+                max_node_idx = batch['edges'].max().item()
+            # --- 디버깅 코드 시작 ---
+            total_nodes = batch['node_features'].size(0)
+            
             optimizer.zero_grad()
             
             gt_pose = batch['rel_pose'].to(device)
-            # iters=8은 우리가 설계한 업데이트 루프 횟수입니다.
+        
             outputs = model(batch, iters=8) 
             
             loss, l_p, l_w = total_loss(outputs, gt_pose)
             
             loss.backward()
-            # Gradient Clipping: 안정적인 학습을 위해 필수
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 

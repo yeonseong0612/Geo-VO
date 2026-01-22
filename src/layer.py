@@ -12,7 +12,7 @@ class GeometricGAT(nn.Module):
                                heads=heads, edge_dim=3, concat=True)
         self.projector = nn.Linear(out_channels * heads, out_channels)
         self.SiLU = nn.SiLU()
-
+        nn.init.constant_(self.projector.bias, 0.1)
     def forward(self, x, edge_index, edge_attr):
         x = self.conv1(x, edge_index, edge_attr)
         x = self.SiLU(x)
@@ -115,12 +115,7 @@ class UpdateBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(256, 2)
         )
-        self.weight_head = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.SiLU(),
-            nn.Linear(256, 2),
-            nn.Sigmoid()
-        )
+        self.weight_head = SafeWeightHead(hidden_dim)
         self.alpha_pose_head = nn.Sequential(
             nn.Linear(hidden_dim, 128),
             nn.SiLU(),
@@ -163,12 +158,12 @@ class UpdateBlock(nn.Module):
         # 6. Heads 연산
         r = self.residual_head(h)    
         w = self.weight_head(h)        
-        a_p = self.alpha_pose_head(h).mean(dim=1) 
-        a_d = self.alpha_depth_head(h) 
+        a_p = self.alpha_pose_head(h).mean(dim=1) + 1e-3
+        a_d = self.alpha_depth_head(h) + 1e-3
 
         return h, r, w, a_p, a_d
 class DBASolver(nn.Module):
-    def __init__(self):
+    def __init__(self): 
         super().__init__()
 
     def forward(self, r, w, J_p, J_d, lmbda):
@@ -206,7 +201,7 @@ class DBASolver(nn.Module):
 
         # 4. 선형 시스템 풀기 (H_eff * delta_pose = g_eff)
         # H_eff가 여전히 불안정할 수 있으므로 작은 Ridge(eps)를 추가합니다.
-        eps_ridge = 1e-4
+        eps_ridge = 1e-3
         diag_idx = torch.arange(H_eff.shape[-1], device=H_eff.device)
         H_eff[:, diag_idx, diag_idx] += eps_ridge
         
@@ -249,9 +244,8 @@ class GraphUpdateBlock(nn.Module):
         self.residual_head = nn.Sequential(
             nn.Linear(hidden_dim, 256), nn.SiLU(), nn.Linear(256, 2)
         )
-        self.weight_head = nn.Sequential(
-            nn.Linear(hidden_dim, 256), nn.SiLU(), nn.Linear(256, 2), nn.Sigmoid()
-        )
+        self.weight_head = SafeWeightHead(hidden_dim)
+        
         self.alpha_pose_head = nn.Sequential(
             nn.Linear(hidden_dim, 128), nn.SiLU(), nn.Linear(128, 1), nn.Softplus()
         )
@@ -260,24 +254,50 @@ class GraphUpdateBlock(nn.Module):
         )
 
     def forward(self, h, c_temp, c_stereo, e_proj, f_Lt, edges, edge_attr):
-        # f_Lt: [Total_N, D] (이제 2차원으로 들어옴)
+        # h, f_Lt 등: [B_total, 800, D]
+        B_total, N, D = f_Lt.shape
+        device = f_Lt.device
         
-        # 1. 모든 특징 결합
-        x = torch.cat([c_temp, c_stereo, e_proj, f_Lt], dim=-1) # [Total_N, 770]
-        if x.dim() == 3:
-            x = x.view(-1, x.shape[-1])
+        x = torch.cat([c_temp, c_stereo, e_proj, f_Lt], dim=-1) # [B_total, 800, 770]
+        x_flat = x.reshape(-1, x.size(-1))
         
-        # 2. GAT 연산 (x_flat 과정 필요 없음)
-        x_spatial, _ = self.spatial_gat(x, edges, edge_attr)
+        flat_edges_list = []
+        flat_attr_list = []
+        for i in range(B_total):
+            # 1. edges를 GPU로 이동
+            e = edges[i] if isinstance(edges[i], torch.Tensor) else torch.tensor(edges[i])
+            flat_edges_list.append(e.to(device) + i * N)
+            
+            # 2. edge_attr를 GPU로 이동
+            a = edge_attr[i] if isinstance(edge_attr[i], torch.Tensor) else torch.tensor(edge_attr[i])
+            flat_attr_list.append(a.to(device))
+            
+        # 3. 결합된 텐서들이 확실히 GPU에 있도록 보장
+        edges_combined = torch.cat(flat_edges_list, dim=1).to(device)
+        edge_attr_combined = torch.cat(flat_attr_list, dim=0).to(device)
         
-        # 3. GRU 업데이트 (h도 [Total_N, D] 여야 함)
-        h_new = self.gru(x_spatial, h)
+        # 이제 GAT 연산 시 에러가 나지 않습니다.
+        x_spatial_flat, _ = self.spatial_gat(x_flat, edges_combined, edge_attr_combined)
+        x_spatial = x_spatial_flat.view(B_total, N, -1)
         
-        # 4. Heads 연산
+        h_flat = self.gru(x_spatial.reshape(-1, x_spatial.size(-1)), 
+                          h.reshape(-1, h.size(-1)))
+        h_new = h_flat.view(B_total, N, -1)
+        
         r = self.residual_head(h_new)
-        w = self.weight_head(h_new)
+        w = self.weight_head(h_new) 
         
-        a_p = self.alpha_pose_head(h_new) 
-        a_d = self.alpha_depth_head(h_new) 
+        a_p = self.alpha_pose_head(h_new).mean(dim=1) + 1e-4
+        a_d = self.alpha_depth_head(h_new) + 1e-4
 
-        return h_new, r, w, a_p, a_d
+        return h_new, r, w, a_p, a_d 
+
+
+class SafeWeightHead(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, 256), nn.SiLU(), nn.Linear(256, 2), nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.net(x) * 0.95 + 0.05

@@ -27,17 +27,42 @@ class VO(nn.Module):
 
         # --- feature and descriptor ---
         if self.training:
-            node_feats = batch['node_features'].to(device)                      # [Total_N 256+2(uv)]
-            edges = batch['edges'].to(device)                                   # [2, Total_E]
-            edge_attr = batch['edge_attr'].to(device)                           # [Total_N, 1]
-            kpts_all = batch['kpts'].to(device)                                 # [Total_N, 2]
+            # node_feats shape: [B*4, 800, 258]
+            node_feats = batch['node_features'].to(device)
+            edges_list = batch['edges']      # List of [2, E_i]
+            edge_attr_list = batch['edge_attr'] # List of [E_i, 3]
+            kpts_all = batch['kpts'].to(device)
 
-            BN = node_feats.shape[0]                                            # Total_Nodes
-            D = node_feats.shape[-1]                                            # 258
-            refined_desc_all, _ = self.GAT(node_feats.view(-1, D), edges, edge_attr) # [Total_N, 256]2
-            refined_desc_all = refined_desc_all.view(BN, -1, 256)               # [B, N, 256]
+            B_total, N, D = node_feats.shape # B_total = B * 4
+
+            # 1. 가변 길이 엣지 리스트를 GPU에서 통합 (오프셋 적용)
+            flat_edges_list = []
+            flat_attr_list = []
+            for i in range(B_total):
+                # 각 뷰/배치마다 노드 오프셋(i * 800)을 더함
+                e = edges_list[i].to(device) if not isinstance(edges_list[i], torch.Tensor) else edges_list[i].to(device)
+                flat_edges_list.append(e + i * N)
+                
+                a = edge_attr_list[i].to(device) if not isinstance(edge_attr_list[i], torch.Tensor) else edge_attr_list[i].to(device)
+                flat_attr_list.append(a)
+            
+            # GAT 입력을 위한 통합 텐서
+            edges_combined = torch.cat(flat_edges_list, dim=1)      # [2, Total_E]
+            edge_attr_combined = torch.cat(flat_attr_list, dim=0)   # [Total_E, 3]
+
+            # 2. GAT 연산
+            # node_feats를 [Total_N, D]로 펼쳐서 전달
+            refined_desc_all, _ = self.GAT(node_feats.reshape(-1, D), edges_combined, edge_attr_combined)
+            
+            # 3. 다시 원래 모양 [B*4, 800, 256]으로 복구
+            refined_desc_all = refined_desc_all.view(B_total, N, -1)
+            
+            # UpdateBlock을 위해 edges 정보를 보존 (나중에 UpdateBlock 안에서 또 써야 하므로)
+            edges = edges_list
+            edge_attr = edge_attr_list
         
         else:
+            # Test/Inference 모드 (이미 텐서로 합쳐져 있는 구조 유지)
             images = batch['images'].to(device)
             B, V, C, H, W = images.shape
             images_flat = images.view(B*V, C, H, W)
@@ -68,6 +93,7 @@ class VO(nn.Module):
             refined_desc_all, _ = self.GAT(node_feats.view(-1, 258), edges, edge_attr)
             refined_desc_all = refined_desc_all.view(B*V, -1, 256)
 
+        # --- Iterative Update Loop 준비 ---
         refined_desc_all = refined_desc_all.view(B, 4, -1, 256)
         kpts_all = kpts_all.view(B, 4, -1, 2)
         
@@ -93,7 +119,11 @@ class VO(nn.Module):
 
         for i in range(iters):
             e_proj = self.cyclic_module(kpts_Lt, curr_depth, curr_pose, calib)
+            
+            # UpdateBlock 호출 (h, f_Lt 등은 [B, N, D] 형태)
+            # edges가 리스트라면 UpdateBlock 내부에서 i*N 오프셋을 처리해야 함
             h, r, w, a_p, a_d = self.update_block(h, c_temp, c_stereo, e_proj, f_Lt, edges, edge_attr) 
+            
             J_p, J_d = compute_projection_jacobian(kpts_Lt, curr_depth, calib)
             delta_pose_dba, delta_depth_dba = self.DBA(r, w, J_p, J_d, self.lmbda)
             curr_pose, curr_depth = self.DBA_Updater(curr_pose, curr_depth, delta_pose_dba, delta_depth_dba, a_p, a_d)

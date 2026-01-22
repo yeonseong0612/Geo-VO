@@ -7,43 +7,49 @@ def pose_geodesic_loss(pred_poses, gt_pose, gamma=0.8):
         gt_pose = SE3(gt_pose)
 
     n_iters, B = pred_poses.shape[:2]
-    gt_pose_expanded = gt_pose.view(1, B) 
+    try:
+        gt_pose_expanded = gt_pose[None]
+    except:
+        gt_pose_expanded = SE3(gt_pose.data.view(1, B, 7))
     
     relative_pose = pred_poses.inv() * gt_pose_expanded
-    diff = relative_pose.log() # [8, 4, 6] -> (trans_x, y, z, rot_x, y, z)
+    diff = relative_pose.log()
     
-    # --- 비중 조절 구간 ---
-    trans_err = diff[..., :3].norm(dim=-1) # 이동 오차
-    rot_err = diff[..., 3:].norm(dim=-1)   # 회전 오차
+    trans_err = diff[..., :3].norm(dim=-1)
+    rot_err = diff[..., 3:].norm(dim=-1)
     
-    # 보통 회전(rad)이 작으므로 회전에 높은 가중치(w_rot)를 줍니다.
-    # 예: 이동 1.0 : 회전 100.0 (데이터셋에 따라 조정)
     w_rot = 10.0 
     err = trans_err + w_rot * rot_err 
-    # ----------------------
     
-    err = err.mean(dim=-1) # 배치의 평균
-    weights = gamma ** torch.arange(n_iters, device=err.device).flip(0)
-    return (weights * err).sum()
+    i = torch.arange(n_iters, device=err.device)
+    weights = gamma**(n_iters - i - 1)
+    
+    loss = (weights * err.mean(dim=-1)).sum()
+    return loss
 
 def weight_reg_loss(weight_history, reproj_errors, gamma=0.8):
     n_iters = weight_history.shape[0]
 
-    # Huber Loss 적용 (PyTorch 내장 함수 사용)
-    # delta=1.0은 오차가 1픽셀 이상이면 선형적으로 처리하겠다는 뜻입니다.
+    # --- [수정 1] 가중치 0 수렴 방지 (Clamp) ---
+    # 모델이 0을 내뱉어도 최소 0.01은 유지하게 하여 꼼수를 차단합니다.
+    weight_history = torch.clamp(weight_history, min=0.01)
+
+    # --- [수정 2] 휴버 로스 델타 하향 (제안하신 내용) ---
+    # 0.5 픽셀만 틀려도 모델이 오차를 민감하게 느끼게 합니다.
     huber_err = F.huber_loss(reproj_errors, torch.zeros_like(reproj_errors), 
-                             reduction='none', delta=1.0)
+                             reduction='none', delta=0.5)
     
-    # 가중 오차 계산
     weighted_err = (weight_history * huber_err).mean(dim=(1, 2, 3))
     
-    # 정규화 항 (기존과 동일)
-    log_weight = torch.log(weight_history + 1e-6)
+    # --- [수정 3] 정규화 계수 강화 ---
+    # 가중치를 키우라는 압박(reg)을 더 세게 줍니다.
+    log_weight = torch.log(weight_history) 
     reg = -log_weight.mean(dim=(1, 2, 3)) 
     
     weights = gamma ** torch.arange(n_iters, device=weighted_err.device).flip(0)
-    loss = (weights * (weighted_err + 0.01 * reg)).sum()
     
+    # reg 앞에 1.0(혹은 그 이상)을 곱해 가중치 유지를 강요합니다.
+    loss = (weights * (weighted_err + 1.0 * reg)).sum() 
     return loss
 
 def total_loss(outputs, gt_pose):
@@ -51,9 +57,9 @@ def total_loss(outputs, gt_pose):
     
     l_pose = pose_geodesic_loss(poses_h, gt_pose, gamma=0.8)
     l_weight = weight_reg_loss(weights_h, errors_h, gamma=0.8)
-    
-    # l_pose와 l_weight의 스케일을 맞추는 것이 핵심입니다.
-    # 초기 학습 시 l_pose가 너무 작다면 0.05를 0.1 정도로 높여보세요.
-    t_loss = l_pose + 0.05 * l_weight
+
+    # --- [수정 4] 전체 밸런스 조정 ---
+    # Pose Loss가 움직이게 하려면 Weight Loss도 무시 못 할 수준으로 더해줘야 합니다.
+    t_loss = l_pose + 1.0 * l_weight 
     
     return t_loss, l_pose.detach(), l_weight.detach()
