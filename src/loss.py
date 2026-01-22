@@ -32,7 +32,7 @@ def pose_geodesic_loss(poses_h, gt_pose, gamma=0.8):
         weight = gamma ** (n_iters - i - 1)
         # 회전(r_err)은 라디안 단위이므로 이동(t_err)보다 민감합니다. 
         # 보통 회전에 10~50배 가중치를 둡니다.
-        total_loss += weight * (t_err + 10.0 * r_err)
+        total_loss += weight * (t_err + 50.0 * r_err)
         
         total_t_err += t_err.item()
         total_r_err += r_err.item()
@@ -52,7 +52,7 @@ def weight_reg_loss(weight_history, reproj_errors, gamma=0.8):
     i = torch.arange(n_iters, device=weighted_err.device)
     weights = gamma**(n_iters - i - 1)
     
-    loss = (weights * (weighted_err + 0.1 * reg)).sum() 
+    loss = (weights * (weighted_err + 0.01 * reg)).sum() 
     return loss
 
 def total_loss(outputs, gt_pose):
