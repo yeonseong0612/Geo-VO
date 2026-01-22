@@ -13,7 +13,7 @@ from datetime import datetime
 from CFG.vo_cfg import vo_cfg as cfg
 from src.model import VO
 from src.loader import DataFactory, vo_collate_fn
-from src.loss import total_loss
+from src.loss import total_loss  # 수정된 total_loss 임포트
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -31,7 +31,6 @@ def train(rank, world_size, cfg):
     
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     
-    # 데이터셋 로드
     dataset = DataFactory(cfg, mode='train')
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if is_ddp else None
     loader = DataLoader(
@@ -44,10 +43,7 @@ def train(rank, world_size, cfg):
         pin_memory=True
     )
 
-    # 1. 모델 초기화
     model = VO(cfg).to(device)
-    
-    # 2. DDP 설정 (이 부분이 빠져있어서 에러가 났었습니다)
     if is_ddp:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
@@ -62,18 +58,16 @@ def train(rank, world_size, cfg):
         if not os.path.exists(cfg.logdir):
             os.makedirs(cfg.logdir)
         
-        # 텍스트 로그 파일 생성
         log_path = os.path.join(cfg.logdir, f"train_log_{datetime.now().strftime('%m%d_%H%M')}.txt")
         log_file = open(log_path, "w")
         log_file.write(f"Training Start: {datetime.now()}\n")
         log_file.write(f"Config: Epochs={cfg.maxepoch}, BatchSize={cfg.batchsize}, LR={cfg.learning_rate}\n")
-        log_file.write("-" * 80 + "\n")
+        log_file.write("-" * 100 + "\n")
         log_file.flush()
 
         writer = SummaryWriter(log_dir=os.path.join(cfg.logdir, 'tensorboard'))
         print(f"==> 학습 시작: Log 저장위치={log_path}")
 
-    # --- Training Loop ---
     for epoch in range(cfg.maxepoch):
         if is_ddp:
             sampler.set_epoch(epoch)
@@ -88,13 +82,12 @@ def train(rank, world_size, cfg):
             gt_pose = batch['rel_pose'].to(device)
             outputs = model(batch, iters=8) 
             
-            loss, l_p, l_w = total_loss(outputs, gt_pose)
+            loss, t_err, r_err, l_w = total_loss(outputs, gt_pose)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            # --- lmbda 및 주요 수치 모니터링 ---
             raw_model = model.module if is_ddp else model
             curr_lmbda = raw_model.lmbda.item()
 
@@ -103,37 +96,37 @@ def train(rank, world_size, cfg):
 
             if rank == 0:
                 pbar.set_postfix({
-                    "Loss": f"{loss.item():.4f}", 
-                    "Avg": f"{avg_loss:.4f}", 
-                    "Pose": f"{l_p:.4f}",
-                    "Lmbda": f"{curr_lmbda:.2e}"
+                    "L": f"{loss.item():.3f}", 
+                    "T": f"{t_err:.3f}", 
+                    "R": f"{r_err:.3f}",
+                    "Lm": f"{curr_lmbda:.1e}"
                 })
 
                 global_step = epoch * len(loader) + i
                 writer.add_scalar('Batch/Loss', loss.item(), global_step)
-                writer.add_scalar('Batch/Pose_Loss', l_p, global_step)
+                writer.add_scalar('Batch/Trans_Err', t_err, global_step) # 추가
+                writer.add_scalar('Batch/Rot_Err', r_err, global_step)     # 추가
                 writer.add_scalar('Batch/Weight_Loss', l_w, global_step)
                 writer.add_scalar('Batch/Lambda', curr_lmbda, global_step)
 
-        # Epoch 종료 후 처리
         scheduler.step()
 
         if rank == 0:
             current_lr = optimizer.param_groups[0]['lr']
-            log_str = (f"[Epoch {epoch}] Avg Loss: {avg_loss:.6f} | Pose Loss: {l_p:.6f} | "
-                       f"Weight Loss: {l_w:.6f} | Lmbda: {curr_lmbda:.2e} | LR: {current_lr:.8f}\n")
+            log_str = (f"[Epoch {epoch}] AvgL: {avg_loss:.5f} | TErr: {t_err:.5f} | RErr: {r_err:.5f} | "
+                       f"WLoss: {l_w:.7f} | Lm: {curr_lmbda:.2e} | LR: {current_lr:.7f}\n")
             print(f"\n{log_str}")
             
             log_file.write(log_str)
             log_file.flush()
 
             writer.add_scalar('Epoch/Avg_Loss', avg_loss, epoch)
-            writer.add_scalar('Epoch/Learning_Rate', current_lr, epoch)
+            writer.add_scalar('Epoch/Trans_Err', t_err, epoch)
+            writer.add_scalar('Epoch/Rot_Err', r_err, epoch)
             writer.add_scalar('Epoch/Lambda', curr_lmbda, epoch)
 
-            # 가중치 저장
             save_path = os.path.join(cfg.logdir, f"vo_model_{epoch}.pth")
-            state_dict = raw_model.state_dict() # DDP 래퍼 제거 후 저장
+            state_dict = raw_model.state_dict()
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': state_dict,
