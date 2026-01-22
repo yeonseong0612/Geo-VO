@@ -27,25 +27,21 @@ def pose_geodesic_loss(pred_poses, gt_pose, gamma=0.8):
     return (weights * err).sum()
 
 def weight_reg_loss(weight_history, reproj_errors, gamma=0.8):
-    """
-    weight_history: [8, B, 800, 1] - GRU가 예측한 신뢰도
-    reproj_errors: [8, B, 800, 2]  - 순환 매칭 오차 (u, v 차이)
-    """
     n_iters = weight_history.shape[0]
 
-    # 1. 가중 오차 계산 (L1 대신 Robust한 학습을 위해 Huber나 Squared도 고려 가능)
-    # 오차가 클수록 weight가 낮아지도록 유도됨
-    weighted_err = (weight_history * reproj_errors.abs()).mean(dim=(1, 2, 3))
+    # Huber Loss 적용 (PyTorch 내장 함수 사용)
+    # delta=1.0은 오차가 1픽셀 이상이면 선형적으로 처리하겠다는 뜻입니다.
+    huber_err = F.huber_loss(reproj_errors, torch.zeros_like(reproj_errors), 
+                             reduction='none', delta=1.0)
     
-    # 2. 정규화 항 (Weight가 0으로 수렴하는 것을 방지)
-    # -log(w)는 w가 1에 가까워지도록 밀어내는 힘입니다.
+    # 가중 오차 계산
+    weighted_err = (weight_history * huber_err).mean(dim=(1, 2, 3))
+    
+    # 정규화 항 (기존과 동일)
     log_weight = torch.log(weight_history + 1e-6)
     reg = -log_weight.mean(dim=(1, 2, 3)) 
     
     weights = gamma ** torch.arange(n_iters, device=weighted_err.device).flip(0)
-    
-    # 3. 최종 합산
-    # 순환 오차는 픽셀 단위이므로 스케일이 큼 -> 0.01 같은 작은 상수로 조절
     loss = (weights * (weighted_err + 0.01 * reg)).sum()
     
     return loss
