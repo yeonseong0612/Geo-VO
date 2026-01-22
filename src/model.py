@@ -12,13 +12,12 @@ class VO(nn.Module):
         self.extractor = SuperPointExtractor()
         self.DT = compute_delaunay_edges
         self.GAT = GeometricGAT(in_channels=258, out_channels=256)
-        self.corr_block = CorrBlock()
         self.cyclic_module = CyclicErrorModule(cfg.baseline)       
         self.update_block = GraphUpdateBlock(hidden_dim=256)
         self.init_depth_net = nn.Linear(256, 1)
         self.DBA = DBASolver()
         self.DBA_Updater = PoseDepthUpdater()
-        self.lmbda = nn.Parameter(torch.tensor(1e-4))
+        self.lmbda = nn.Parameter(torch.tensor(1e-3))
 
     def forward(self, batch, iters=8):
         device = self.lmbda.device
@@ -62,7 +61,6 @@ class VO(nn.Module):
             edge_attr = edge_attr_list
         
         else:
-            # Test/Inference 모드 (이미 텐서로 합쳐져 있는 구조 유지)
             images = batch['images'].to(device)
             B, V, C, H, W = images.shape
             images_flat = images.view(B*V, C, H, W)
@@ -99,14 +97,8 @@ class VO(nn.Module):
         
         f_all = refined_desc_all 
         f_Lt = f_all[:, 0]
-        f_others = f_all[:, 1:3] 
         kpts_Lt = kpts_all[:, 0]
         
-        f_Lt_expand = f_Lt.unsqueeze(1).expand(-1, 2, -1, -1)
-        combined_corr = self.corr_block(f_Lt_expand, f_others)
-        
-        c_stereo = combined_corr[:, 0]
-        c_temp = combined_corr[:, 1]
 
         N = kpts_Lt.shape[1]
         curr_pose = SE3.Identity(B, device=device)
@@ -120,9 +112,7 @@ class VO(nn.Module):
         for i in range(iters):
             e_proj = self.cyclic_module(kpts_Lt, curr_depth, curr_pose, calib)
             
-            # UpdateBlock 호출 (h, f_Lt 등은 [B, N, D] 형태)
-            # edges가 리스트라면 UpdateBlock 내부에서 i*N 오프셋을 처리해야 함
-            h, r, w, a_p, a_d = self.update_block(h, c_temp, c_stereo, e_proj, f_Lt, edges, edge_attr) 
+            h, r, w, a_p, a_d = self.update_block(h, e_proj, f_Lt, edges, edge_attr) 
             
             J_p, J_d = compute_projection_jacobian(kpts_Lt, curr_depth, calib)
             delta_pose_dba, delta_depth_dba = self.DBA(r, w, J_p, J_d, self.lmbda)

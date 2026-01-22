@@ -68,9 +68,6 @@ class CyclicErrorModule(nn.Module):
         if self.stereo_offset is None or self.stereo_offset.device != device:
             disp_vec = torch.tensor([self.baseline, 0, 0, 0, 0, 0, 1.0], device=device)
             raw_se3 = SE3.InitFromVec(disp_vec) 
-            
-            # [수정] unsqueeze 대신 view를 사용하되, 인자를 반드시 '튜플'로 전달
-            # 이렇게 하면 lietorch 내부의 '리스트 + 튜플' 에러를 피할 수 있습니다.
             self.stereo_offset = raw_se3.view((1, 1)) 
             self.stereo_inv = self.stereo_offset.inv()
 
@@ -78,25 +75,14 @@ class CyclicErrorModule(nn.Module):
         pts_3d_Lt = self.backproject(kpts, depth, intrinsics) # [B, N, 3]
 
         # 2. SE3 객체들의 차원 맞추기 (AssertionError 방지 핵심)
-        # poses가 [B] 형태라면 view나 unsqueeze로 [B, 1]로 만듭니다.
-        # lietorch SE3 객체는 .view()를 사용합니다.
         curr_poses = poses.view((poses.shape[0], 1)) # [B, 1]
         
-        # stereo_offset은 이미 위에서 [1, 1]로 만드셨을 겁니다.
-        # 만약 에러가 난다면 이 녀석도 체크가 필요합니다.
 
         # 3. Cycle 연산 수행
-        # [1, 1] act [B, N, 3] -> [B, N, 3]
         pts_3d_Rt = self.stereo_offset.act(pts_3d_Lt)
-        
-        # [B, 1] act [B, N, 3] -> [B, N, 3] (이제 여기서 에러가 안 납니다!)
         pts_3d_Rt1 = curr_poses.act(pts_3d_Rt)
-        
-        # Lt1 방향으로 돌아오는 연산들도 동일하게 적용
         pts_3d_Lt1 = self.stereo_inv.act(pts_3d_Rt1)
         pts_3d_Lt_final = curr_poses.inv().act(pts_3d_Lt1)
-
-        # 4. 재투영 (Projection)
         kpts_Lt_final = self.project(pts_3d_Lt_final, intrinsics)
         return kpts_Lt_final - kpts
     
@@ -171,7 +157,6 @@ class DBASolver(nn.Module):
         W = w.unsqueeze(-1) # [B, N, 2, 1] (Weighting mask)
 
         # 1. Hessian & Gradient 블록 계산
-        # 안정성을 위해 연산 전 단계에서 아주 작은 값(eps)을 고려합니다.
         eps_stable = 1e-7
         
         H_pp = torch.matmul(J_p.transpose(-1, -2), W * J_p).sum(dim=1) # [B, 6, 6]
@@ -182,9 +167,9 @@ class DBASolver(nn.Module):
         g_d = torch.matmul(J_d.transpose(-1, -2), W * r.unsqueeze(-1)).squeeze(-1) # [B, N, 1]
 
         # 2. Levenberg-Marquardt Damping (lmbda) 적용
-        # H_dd는 대각 성분이므로 lmbda를 더해 역수 연산 시 안정성을 확보합니다.
-        H_pp = H_pp + lmbda.view(-1, 1, 1) * torch.eye(6, device=H_pp.device)
-        H_dd = H_dd + lmbda.view(-1, 1, 1) + eps_stable
+        safe_lmbda = torch.abs(lmbda) + 1e-6
+        H_pp = H_pp + safe_lmbda.view(-1, 1, 1) * torch.eye(6, device=H_pp.device)
+        H_dd = H_dd + safe_lmbda.view(-1, 1, 1) + eps_stable
 
         # 3. Schur Complement를 이용한 차원 축소 연산
         # inv_H_dd = 1 / H_dd
@@ -247,18 +232,18 @@ class GraphUpdateBlock(nn.Module):
         self.weight_head = SafeWeightHead(hidden_dim)
         
         self.alpha_pose_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128), nn.SiLU(), nn.Linear(128, 1), nn.Softplus()
+            nn.Linear(hidden_dim, 128), nn.SiLU(), nn.Linear(128, 1), nn.Sigmoid()
         )
         self.alpha_depth_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128), nn.SiLU(), nn.Linear(128, 1), nn.Softplus()
+            nn.Linear(hidden_dim, 128), nn.SiLU(), nn.Linear(128, 1), nn.Sigmoid()
         )
 
-    def forward(self, h, c_temp, c_stereo, e_proj, f_Lt, edges, edge_attr):
-        # h, f_Lt 등: [B_total, 800, D]
-        B_total, N, D = f_Lt.shape
+    def forward(self, h, e_proj, f_Lt, edges, edge_attr):
         device = f_Lt.device
+
+        x = torch.cat([e_proj, f_Lt], dim=-1) 
         
-        x = torch.cat([c_temp, c_stereo, e_proj, f_Lt], dim=-1) # [B_total, 800, 770]
+        B_total, N, D = f_Lt.shape
         x_flat = x.reshape(-1, x.size(-1))
         
         flat_edges_list = []
@@ -276,21 +261,23 @@ class GraphUpdateBlock(nn.Module):
         edges_combined = torch.cat(flat_edges_list, dim=1).to(device)
         edge_attr_combined = torch.cat(flat_attr_list, dim=0).to(device)
         
-        # 이제 GAT 연산 시 에러가 나지 않습니다.
         x_spatial_flat, _ = self.spatial_gat(x_flat, edges_combined, edge_attr_combined)
         x_spatial = x_spatial_flat.view(B_total, N, -1)
         
+        # 3. GRU 연산: "이전 루프의 수정 히스토리를 반영"
         h_flat = self.gru(x_spatial.reshape(-1, x_spatial.size(-1)), 
-                          h.reshape(-1, h.size(-1)))
+                        h.reshape(-1, h.size(-1)))
         h_new = h_flat.view(B_total, N, -1)
         
-        r = self.residual_head(h_new)
-        w = self.weight_head(h_new) 
+        # 4. Heads: 수정량(r)과 신뢰도(w), 그리고 보폭(alpha) 계산
+        r = self.residual_head(h_new) # [B, N, 2] -> dx, dy 수정 제안
+        w = self.weight_head(h_new)   # [B, N, 2] -> 각 점의 신뢰도 가중치
         
-        a_p = self.alpha_pose_head(h_new).mean(dim=1) + 1e-4
-        a_d = self.alpha_depth_head(h_new) + 1e-4
+        # 포즈 업데이트를 위한 대표값 추출 (모든 점의 의견을 평균)
+        a_p = self.alpha_pose_head(h_new).mean(dim=1) + 1e-4 # [B, 1]
+        a_d = self.alpha_depth_head(h_new) + 1e-4            # [B, N, 1]
 
-        return h_new, r, w, a_p, a_d 
+        return h_new, r, w, a_p, a_d
 
 
 class SafeWeightHead(nn.Module):
