@@ -7,9 +7,9 @@ class GeometricGAT(nn.Module):
     def __init__(self, in_channels = 256, hidden_channels = 256, out_channels = 256, heads = 4):
         super().__init__()
         self.conv1 = GATv2Conv(in_channels, hidden_channels // heads,
-                               heads=heads, edge_dim=1)
+                               heads=heads, edge_dim=3)
         self.conv2 = GATv2Conv(hidden_channels, out_channels, 
-                               heads=heads, edge_dim=1, concat=True)
+                               heads=heads, edge_dim=3, concat=True)
         self.projector = nn.Linear(out_channels * heads, out_channels)
         self.SiLU = nn.SiLU()
 
