@@ -111,9 +111,9 @@ def export_parallel(model, dataloader, save_dir, num_cpu):
     pool.close()
     pool.join()
 if __name__ == "__main__":
-    SAVE_PATH = "/home/jnu-ie/kys/Geo-VO/geovo_prcomputed"
+    SAVE_PATH = "/home/jnu-ie/kys/Geo-VO/gendata/precomputed"
     
-    model = VO(baseline=0.54).cuda()
+    model = VO(vo_cfg).cuda()
     print("모델 로드 완료")
 
     dataset = DataFactory(vo_cfg, mode='train')
