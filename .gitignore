@@ -2,3 +2,4 @@
 *.pyc
 gendata/
 geovo_precomputed/
+.pth

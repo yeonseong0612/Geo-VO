@@ -2,31 +2,42 @@ import torch
 import torch.nn.functional as F
 from lietorch import SE3
 
-def pose_geodesic_loss(pred_poses, gt_pose, gamma=0.8):
+def pose_geodesic_loss(poses_h, gt_pose, gamma=0.8):
+    
+    n_iters = poses_h.shape[0]
+    B = gt_pose.shape[0]
+    
     if isinstance(gt_pose, torch.Tensor):
         gt_pose = SE3(gt_pose)
+        
+    total_loss = 0.0
+    total_t_err = 0.0
+    total_r_err = 0.0
+    
+    for i in range(n_iters):
+        # i번째 이터레이션 예측값 추출 및 SE3 변환
+        pred_data = poses_h[i]
+        pred_pose = SE3(pred_data) if isinstance(pred_data, torch.Tensor) else pred_data
+        
+        # 이제 .inv() 연산이 가능합니다.
+        # dP = pred * gt.inv() -> 두 포즈 사이의 차이 계산
+        diff = pred_pose * gt_pose.inv()
+        
+        # Geodesic Error 추출 (Log map)
+        v = diff.log() # [B, 6] -> (tx, ty, tz, rx, ry, rz)
+        
+        t_err = v[:, :3].norm(dim=-1).mean()
+        r_err = v[:, 3:].norm(dim=-1).mean()
+        
+        weight = gamma ** (n_iters - i - 1)
+        # 회전(r_err)은 라디안 단위이므로 이동(t_err)보다 민감합니다. 
+        # 보통 회전에 10~50배 가중치를 둡니다.
+        total_loss += weight * (t_err + 10.0 * r_err)
+        
+        total_t_err += t_err.item()
+        total_r_err += r_err.item()
 
-    n_iters, B = pred_poses.shape[:2]
-    gt_pose_expanded = gt_pose[None].expand(n_iters, B, -1)
-    
-    relative_pose = pred_poses.inv() * gt_pose_expanded
-    diff = relative_pose.log() # [iters, B, 6]
-    
-    trans_err = diff[..., :3].norm(dim=-1) # [iters, B]
-    rot_err = diff[..., 3:].norm(dim=-1)   # [iters, B]
-    
-    w_rot = 15.0 
-    w_trans = 1.0
-    
-    err = w_trans * trans_err + w_rot * rot_err 
-    
-    i = torch.arange(n_iters, device=err.device)
-    weights = gamma**(n_iters - i - 1)
-    
-    loss = (weights * err.mean(dim=-1)).sum()
-    
-    # 모니터링을 위해 분리된 에러 평균값 반환
-    return loss, trans_err.mean().detach(), rot_err.mean().detach()
+    return total_loss / n_iters, total_t_err / n_iters, total_r_err / n_iters
 
 def weight_reg_loss(weight_history, reproj_errors, gamma=0.8):
     n_iters = weight_history.shape[0]
