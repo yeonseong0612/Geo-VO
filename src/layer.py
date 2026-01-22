@@ -9,13 +9,15 @@ class GeometricGAT(nn.Module):
         self.conv1 = GATv2Conv(in_channels, hidden_channels // heads,
                                heads=heads, edge_dim=1)
         self.conv2 = GATv2Conv(hidden_channels, out_channels, 
-                               heads=heads, edge_dim=1, concat=False)
+                               heads=heads, edge_dim=1, concat=True)
+        self.projector = nn.Linear(out_channels * heads, out_channels)
         self.SiLU = nn.SiLU()
 
     def forward(self, x, edge_index, edge_attr):
         x = self.conv1(x, edge_index, edge_attr)
         x = self.SiLU(x)
         x, (edge_index, alpha) = self.conv2(x, edge_index, edge_attr, return_attention_weights=True)
+        x = self.projector(x)
         
         return x, alpha
     

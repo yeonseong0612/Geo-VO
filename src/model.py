@@ -27,15 +27,15 @@ class VO(nn.Module):
 
         # --- feature and descriptor ---
         if self.training:
-            node_feats = batch['node_features'].to(device)  # [B, 3, 256+2(uv)]
-            edges = batch['edges'].to(device) # [B, N]
-            edge_attr = batch['edge_attr'].to(device) # []
-            kpts_all = batch['kpts'].to(device)
+            node_feats = batch['node_features'].to(device)                      # [Total_N 256+2(uv)]
+            edges = batch['edges'].to(device)                                   # [2, Total_E]
+            edge_attr = batch['edge_attr'].to(device)                           # [Total_N, 1]
+            kpts_all = batch['kpts'].to(device)                                 # [Total_N, 2]
 
-            BN = node_feats.shape[0]
-            D = node_feats.shape[-1]
-            refined_desc_all, _ = self.GAT(node_feats.view(-1, D), edges, edge_attr)
-            refined_desc_all = refined_desc_all.view(BN, -1, 256) 
+            BN = node_feats.shape[0]                                            # Total_Nodes
+            D = node_feats.shape[-1]                                            # 258
+            refined_desc_all, _ = self.GAT(node_feats.view(-1, D), edges, edge_attr) # [Total_N, 256]2
+            refined_desc_all = refined_desc_all.view(BN, -1, 256)               # [B, N, 256]
         
         else:
             images = batch['images'].to(device)
