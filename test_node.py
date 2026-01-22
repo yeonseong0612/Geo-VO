@@ -38,6 +38,5 @@ def check_npz_nodes(data_dir):
             count_num = np.sum(node_counts == count)
             print(f"- {count}개 노드: {count_num}개 파일")
 
-# 사용 예시: 전처리 데이터가 저장된 경로를 넣으세요.
-SAVE_PATH = "/home/jnu-ie/kys/Geo-VO/geovo_prcomputed"
+SAVE_PATH = "/home/jnu-ie/kys/Geo-VO/gendata/precomputed"
 check_npz_nodes(SAVE_PATH)
