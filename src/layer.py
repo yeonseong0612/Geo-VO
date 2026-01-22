@@ -224,7 +224,7 @@ class PoseDepthUpdater(nn.Module):
 class GraphUpdateBlock(nn.Module):
     def __init__(self, hidden_dim=256):
         super().__init__()
-        self.spatial_gat = GeometricGAT(in_channels=770, out_channels=hidden_dim)
+        self.spatial_gat = GeometricGAT(in_channels=258, out_channels=hidden_dim)
         self.gru = nn.GRUCell(input_size=hidden_dim, hidden_size=hidden_dim)
         self.residual_head = nn.Sequential(
             nn.Linear(hidden_dim, 256), nn.SiLU(), nn.Linear(256, 2)

@@ -1,4 +1,0 @@
-Training Start: 2026-01-22 18:04:09.688076
-Config: Epochs=60, BatchSize=4, LR=0.0001
---------------------------------------------------
-[Epoch 0] Avg Loss: 4.429559 | Pose Loss: 4.697646 | Weight Loss: -0.000004 | LR: 0.00010000
