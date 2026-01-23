@@ -24,3 +24,5 @@ Config: Epochs=60, BatchSize=4, LR=0.0001
 [Epoch 20] AvgL: 14.11592 | AvgT: 2.24657 | AvgR: 0.02490 | WLoss: 0.5364659 | Lm: 5.93e-03 | LR: 0.0000500
 [Epoch 21] AvgL: 23.08147 | AvgT: 3.62449 | AvgR: 0.02002 | WLoss: 0.6213078 | Lm: 5.97e-03 | LR: 0.0000500
 [Epoch 22] AvgL: 13.16769 | AvgT: 2.01477 | AvgR: 0.01979 | WLoss: 1.3435271 | Lm: 6.08e-03 | LR: 0.0000500
+[Epoch 23] AvgL: 11.14521 | AvgT: 1.73458 | AvgR: 0.02019 | WLoss: 1.5569963 | Lm: 6.23e-03 | LR: 0.0000500
+[Epoch 24] AvgL: 13.45008 | AvgT: 2.05249 | AvgR: 0.02026 | WLoss: 0.0552460 | Lm: 6.34e-03 | LR: 0.0000500
