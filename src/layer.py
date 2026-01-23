@@ -173,7 +173,7 @@ class DBASolver(nn.Module):
 
         # 3. Schur Complement를 이용한 차원 축소 연산
         # inv_H_dd = 1 / H_dd
-        inv_H_dd = 1.0 / H_dd # [B, N, 1]
+        inv_H_dd = 1.0 / (H_dd + 1e-7) # [B, N, 1]
         H_pd_invHdd = H_pd * inv_H_dd.unsqueeze(-1) # [B, N, 6, 1]
 
         # Reduced Camera Matrix (H_eff) 계산

@@ -17,7 +17,7 @@ class VO(nn.Module):
         self.init_depth_net = nn.Linear(256, 1)
         self.DBA = DBASolver()
         self.DBA_Updater = PoseDepthUpdater()
-        self.log_lmbda = nn.Parameter(torch.tensor(-9.21))
+        self.log_lmbda = nn.Parameter(torch.tensor(-4.6))
 
     def forward(self, batch, iters=8):
         device = self.log_lmbda.device
