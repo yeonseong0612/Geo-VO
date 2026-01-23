@@ -32,8 +32,8 @@ def pose_geodesic_loss(poses_h, gt_pose, gamma=0.8):
         
         weight = gamma ** (n_iters - i - 1)
 
-        t_weight = 50.0 
-        r_weight = 100.0 
+        t_weight = 10.0
+        r_weight = 1.0 
 
         total_loss += weight * (t_weight * t_err + r_weight * r_err)
         

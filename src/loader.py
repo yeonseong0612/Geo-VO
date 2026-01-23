@@ -65,17 +65,24 @@ class DataFactory(data.Dataset):
         pose1 = torch.from_numpy(self.posesdict[seq][imgnum]).float()       # [4, 4]
         pose2 = torch.from_numpy(self.posesdict[seq][imgnum + 1]).float()   # [4, 4]
 
-        se3_1 =  SE3.InitFromVec(matrix_to_7vec(pose1).unsqueeze(0))        # [4, 4] -> [1, 7]
-        se3_2 =  SE3.InitFromVec(matrix_to_7vec(pose2).unsqueeze(0))        # [4, 4] -> [1, 7]
-        rel_pose = (se3_1.inv() * se3_2).data.squeeze(0) # [tx, ty, tz, qx, qy, qz, qw] [1, 7] -> [4, 4]
+        # --- 상대 포즈 계산 (여기까지는 기존과 동일) ---
+        se3_1 = SE3.InitFromVec(matrix_to_7vec(pose1).unsqueeze(0))
+        se3_2 = SE3.InitFromVec(matrix_to_7vec(pose2).unsqueeze(0))
+        rel_se3 = se3_1.inv() * se3_2
+        
+
+        # --- [핵심 수정] 데이터 추출 방식을 메서드 호출로 변경 ---
+        # .data를 직접 쓰면 순서가 꼬일 위험이 큽니다.
+        t_final = rel_se3.translation().squeeze(0)[:3]  # 무조건 앞의 3개만 (x, y, z)
+        q_final = rel_se3.data.squeeze(0)[3:7]          # 인덱스를 명시적으로 지정 (qx, qy, qz, qw)
 
         data = {
-            'rel_pose' : rel_pose,
+            'rel_pose' : torch.cat([t_final, q_final], dim=0),
             'calib' : torch.from_numpy(self.calib[seq]),
             'seq' : seq,
             'imgnum' : imgnum
         }
-
+        
         # --- Data Loader ---
         if self.mode == 'train':
             views = ['image_2', 'image_3', 'image_2', 'image_3'] # Lt, Rt, Lt1, Rt1
