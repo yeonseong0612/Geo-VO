@@ -91,8 +91,11 @@ def train(rank, world_size, cfg):
             optimizer.zero_grad()
             
             gt_pose = batch['rel_pose'].to(device)
-            outputs = model(batch, iters=12) 
-            
+            noise = torch.randn_like(gt_pose) * 0.01 
+            gt_guide_pose = gt_pose + noise
+
+            outputs = model(batch, iters=12, gt_guide=gt_guide_pose)
+
             loss, t_err, r_err, l_w = total_loss(outputs, gt_pose)
             
             loss.backward()
