@@ -1,8 +1,0 @@
-Training Start: 2026-01-22 21:41:55.875643
-Config: Epochs=60, BatchSize=4, LR=0.0001
---------------------------------------------------------------------------------
-[Epoch 0] Avg Loss: 4.471143 | Pose Loss: 4.697639 | Weight Loss: 0.000003 | Lmbda: 2.35e-03 | LR: 0.00010000
-[Epoch 1] Avg Loss: 4.439827 | Pose Loss: 6.657487 | Weight Loss: 0.000000 | Lmbda: 5.47e-03 | LR: 0.00010000
-[Epoch 2] Avg Loss: 4.428082 | Pose Loss: 6.222169 | Weight Loss: 0.000000 | Lmbda: 1.50e-02 | LR: 0.00010000
-[Epoch 3] Avg Loss: 4.436601 | Pose Loss: 3.850737 | Weight Loss: 0.000000 | Lmbda: 1.16e-02 | LR: 0.00010000
-[Epoch 4] Avg Loss: 4.452106 | Pose Loss: 3.957085 | Weight Loss: 0.000000 | Lmbda: 8.73e-03 | LR: 0.00010000

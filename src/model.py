@@ -17,10 +17,10 @@ class VO(nn.Module):
         self.init_depth_net = nn.Linear(256, 1)
         self.DBA = DBASolver()
         self.DBA_Updater = PoseDepthUpdater()
-        self.lmbda = nn.Parameter(torch.tensor(1e-3))
+        self.log_lmbda = nn.Parameter(torch.tensor(-9.21))
 
     def forward(self, batch, iters=8):
-        device = self.lmbda.device
+        device = self.log_lmbda.device
         calib = batch['calib'].to(device)
         B = calib.shape[0]
 
@@ -60,12 +60,14 @@ class VO(nn.Module):
             edges = edges_list
             edge_attr = edge_attr_list
         
+        # src/model.py 의 else: 파트 수정
         else:
             images = batch['images'].to(device)
             B, V, C, H, W = images.shape
             images_flat = images.view(B*V, C, H, W)
+            
             kpts_all, desc_all = self.extractor(images_flat)
-
+            
             all_edges = []
             all_edge_attrs = []
             kpts_np = kpts_all.detach().cpu().numpy()
@@ -73,23 +75,44 @@ class VO(nn.Module):
             for i in range(B * V):
                 edge_np = self.DT(kpts_np[i])
                 edge_torch = torch.from_numpy(edge_np).to(device).long()
-                edge_offset = edge_torch + (i * kpts_all.shape[1])
                 
                 src_pts = kpts_all[i][edge_torch[0]]
                 dst_pts = kpts_all[i][edge_torch[1]]
-                attr = torch.norm(src_pts - dst_pts, dim=1, keepdim=True)
                 
-                all_edges.append(edge_offset)
+                # 전처리 순서 [dist, dx, dy] 준수
+                diff = src_pts - dst_pts # 전처리에서 src - dst 였으므로 동일하게
+                dist = torch.norm(diff, dim=1, keepdim=True)
+                attr = torch.cat([dist, diff], dim=1) # [E_i, 3]
+                
+                all_edges.append(edge_torch)
                 all_edge_attrs.append(attr)
             
-            edges = torch.cat(all_edges, dim=1)
-            edge_attr = torch.cat(all_edge_attrs, dim=0)
+            # --- [중요] 변수명 정리 ---
+            # GAT에 넣기 위해 리스트를 보존합니다.
+            edges = all_edges       # List of [2, E_i]
+            edge_attr = all_edge_attrs # List of [E_i, 3]
             
             size_tensor = torch.tensor([W, H], device=device).view(1, 1, 2)
-            node_feats = torch.cat([desc_all.transpose(1, 2), kpts_all / size_tensor], dim=-1)
+            desc_ready = desc_all.transpose(1, 2) if desc_all.shape[1] == 256 else desc_all
+            node_feats = torch.cat([desc_ready, kpts_all / size_tensor], dim=-1) # [BV, 800, 258]
             
-            refined_desc_all, _ = self.GAT(node_feats.view(-1, 258), edges, edge_attr)
+            # 4. GAT 연산 (학습 때와 동일하게 리스트를 처리할 수 있도록 설계되었다면)
+            # 만약 GAT가 리스트를 못 받는다면 여기서만 cat을 해주세요.
+            # 하지만 안전을 위해 아래와 같이 UpdateBlock 직전에 형태를 확정 짓는 것이 좋습니다.
+            
+            # GAT 입력을 위해 잠시 통합 (오프셋 적용)
+            combined_edges_for_gat = []
+            for i, e in enumerate(edges):
+                combined_edges_for_gat.append(e + i * kpts_all.shape[1])
+            
+            gat_edges = torch.cat(combined_edges_for_gat, dim=1)
+            gat_edge_attr = torch.cat(edge_attr, dim=0)
+
+            refined_desc_all, _ = self.GAT(node_feats.view(-1, 258), gat_edges, gat_edge_attr)
             refined_desc_all = refined_desc_all.view(B*V, -1, 256)
+
+            # edges = all_edges  <- 이미 리스트임
+            # edge_attr = all_edge_attrs <- 이미 리스트임
 
         # --- Iterative Update Loop 준비 ---
         refined_desc_all = refined_desc_all.view(B, 4, -1, 256)
@@ -115,7 +138,8 @@ class VO(nn.Module):
             h, r, w, a_p, a_d = self.update_block(h, e_proj, f_Lt, edges, edge_attr) 
             
             J_p, J_d = compute_projection_jacobian(kpts_Lt, curr_depth, calib)
-            delta_pose_dba, delta_depth_dba = self.DBA(r, w, J_p, J_d, self.lmbda)
+            lmbda = torch.exp(self.log_lmbda)
+            delta_pose_dba, delta_depth_dba = self.DBA(r, w, J_p, J_d, lmbda)
             curr_pose, curr_depth = self.DBA_Updater(curr_pose, curr_depth, delta_pose_dba, delta_depth_dba, a_p, a_d)
 
             poses_history.append(curr_pose)

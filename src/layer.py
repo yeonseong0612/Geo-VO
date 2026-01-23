@@ -151,7 +151,6 @@ class UpdateBlock(nn.Module):
 class DBASolver(nn.Module):
     def __init__(self): 
         super().__init__()
-        self.log_lmbda = nn.Parameter(torch.tensor(-9.21)) # ln(1e-4)
 
     def forward(self, r, w, J_p, J_d, lmbda):
         # w: [B, N, 2], r: [B, N, 2], J_p: [B, N, 2, 6], J_d: [B, N, 2, 1]
@@ -168,9 +167,9 @@ class DBASolver(nn.Module):
         g_d = torch.matmul(J_d.transpose(-1, -2), W * r.unsqueeze(-1)).squeeze(-1) # [B, N, 1]
 
         # 2. Levenberg-Marquardt Damping (lmbda) 적용
-        safe_lmbda = torch.exp(self.log_lmbda) + 1e-6        
-        H_pp = H_pp + safe_lmbda * torch.eye(6, device=H_pp.device).unsqueeze(0)
-        H_dd = H_dd + safe_lmbda # H_dd는 [B, N, 1], safe_lmbda는 스칼라이므로 바로 더해짐
+         
+        H_pp = H_pp + lmbda * torch.eye(6, device=H_pp.device).unsqueeze(0)
+        H_dd = H_dd + lmbda # H_dd는 [B, N, 1], safe_lmbda는 스칼라이므로 바로 더해짐
 
         # 3. Schur Complement를 이용한 차원 축소 연산
         # inv_H_dd = 1 / H_dd

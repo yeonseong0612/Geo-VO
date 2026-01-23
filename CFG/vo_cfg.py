@@ -24,11 +24,11 @@ vo_cfg.valsequencelist = ['09', '10']
 vo_cfg.baseline = 0.54
 vo_cfg.num_cpu = 12            
 vo_cfg.batchsize = 4           
-vo_cfg.learning_rate = 1e-4
+vo_cfg.learning_rate = 5e-5
 vo_cfg.maxepoch = 60
 
 vo_cfg.iters = 8                
-vo_cfg.weight_decay = 5e-5     
-vo_cfg.MultiStepLR_milstone = [10, 20, 30, 40]
+vo_cfg.weight_decay = 1e-4     
+vo_cfg.MultiStepLR_milstone = [15, 30, 45]
 vo_cfg.MultiStepLR_gamma = 0.5
 vo_cfg.log_interval = 10        

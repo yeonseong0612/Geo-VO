@@ -2,4 +2,8 @@
 *.pyc
 gendata/
 geovo_precomputed/
-.pth
+
+*.pth
+checkpoint/GEO-VO/tensorboard/
+checkpoint/GEO-VO/test1/
+checkpoint/GEO-VO/test2/

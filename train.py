@@ -13,7 +13,7 @@ from datetime import datetime
 from CFG.vo_cfg import vo_cfg as cfg
 from src.model import VO
 from src.loader import DataFactory, vo_collate_fn
-from src.loss import total_loss  # 수정된 total_loss 임포트
+from src.loss import total_loss
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -47,7 +47,14 @@ def train(rank, world_size, cfg):
     if is_ddp:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=1e-4)
+    raw_model = model.module if is_ddp else model
+    
+    params = [
+        {'params': [p for n, p in raw_model.named_parameters() if 'log_lmbda' not in n], 'lr': cfg.learning_rate},
+        {'params': [raw_model.log_lmbda], 'lr': 1e-3}
+    ]
+    
+    optimizer = optim.AdamW(params, cfg.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=cfg.MultiStepLR_milstone, gamma=cfg.MultiStepLR_gamma
     )
@@ -73,14 +80,18 @@ def train(rank, world_size, cfg):
             sampler.set_epoch(epoch)
         
         model.train()
+        # --- 지표 누적을 위한 변수 초기화 ---
         epoch_loss = 0.0
+        epoch_t_err = 0.0
+        epoch_r_err = 0.0
+        
         pbar = tqdm(loader, desc=f"Epoch {epoch}", disable=(rank != 0))
         
         for i, batch in enumerate(pbar):
             optimizer.zero_grad()
             
             gt_pose = batch['rel_pose'].to(device)
-            outputs = model(batch, iters=8) 
+            outputs = model(batch, iters=12) 
             
             loss, t_err, r_err, l_w = total_loss(outputs, gt_pose)
             
@@ -88,24 +99,31 @@ def train(rank, world_size, cfg):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            raw_model = model.module if is_ddp else model
-            curr_lmbda = raw_model.lmbda.item()
+            # 현재 람다 값 모니터링
+            curr_lmbda = torch.exp(raw_model.log_lmbda).item()
 
+            # --- 지표 누적 및 평균 계산 ---
             epoch_loss += loss.item()
+            epoch_t_err += t_err
+            epoch_r_err += r_err
+            
             avg_loss = epoch_loss / (i + 1)
+            avg_t_err = epoch_t_err / (i + 1)
+            avg_r_err = epoch_r_err / (i + 1)
 
             if rank == 0:
+                # 진행 바에는 실시간 평균값을 표시
                 pbar.set_postfix({
-                    "L": f"{loss.item():.3f}", 
-                    "T": f"{t_err:.3f}", 
-                    "R": f"{r_err:.3f}",
+                    "AvgL": f"{avg_loss:.3f}", 
+                    "AvgT": f"{avg_t_err:.3f}", 
+                    "AvgR": f"{avg_r_err:.3f}",
                     "Lm": f"{curr_lmbda:.1e}"
                 })
 
                 global_step = epoch * len(loader) + i
                 writer.add_scalar('Batch/Loss', loss.item(), global_step)
-                writer.add_scalar('Batch/Trans_Err', t_err, global_step) # 추가
-                writer.add_scalar('Batch/Rot_Err', r_err, global_step)     # 추가
+                writer.add_scalar('Batch/Trans_Err', t_err, global_step)
+                writer.add_scalar('Batch/Rot_Err', r_err, global_step)
                 writer.add_scalar('Batch/Weight_Loss', l_w, global_step)
                 writer.add_scalar('Batch/Lambda', curr_lmbda, global_step)
 
@@ -113,7 +131,8 @@ def train(rank, world_size, cfg):
 
         if rank == 0:
             current_lr = optimizer.param_groups[0]['lr']
-            log_str = (f"[Epoch {epoch}] AvgL: {avg_loss:.5f} | TErr: {t_err:.5f} | RErr: {r_err:.5f} | "
+            # 로그 파일에는 에포크 전체 평균값을 기록
+            log_str = (f"[Epoch {epoch}] AvgL: {avg_loss:.5f} | AvgT: {avg_t_err:.5f} | AvgR: {avg_r_err:.5f} | "
                        f"WLoss: {l_w:.7f} | Lm: {curr_lmbda:.2e} | LR: {current_lr:.7f}\n")
             print(f"\n{log_str}")
             
@@ -121,17 +140,18 @@ def train(rank, world_size, cfg):
             log_file.flush()
 
             writer.add_scalar('Epoch/Avg_Loss', avg_loss, epoch)
-            writer.add_scalar('Epoch/Trans_Err', t_err, epoch)
-            writer.add_scalar('Epoch/Rot_Err', r_err, epoch)
+            writer.add_scalar('Epoch/Avg_Trans_Err', avg_t_err, epoch)
+            writer.add_scalar('Epoch/Avg_Rot_Err', avg_r_err, epoch)
             writer.add_scalar('Epoch/Lambda', curr_lmbda, epoch)
 
             save_path = os.path.join(cfg.logdir, f"vo_model_{epoch}.pth")
-            state_dict = raw_model.state_dict()
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': state_dict,
+                'model_state_dict': raw_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss,
+                't_err': avg_t_err,
+                'r_err': avg_r_err,
                 'lmbda': curr_lmbda
             }, save_path)
 
