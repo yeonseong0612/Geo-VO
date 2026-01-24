@@ -1,74 +1,53 @@
 import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from src.loader import DataFactory, vo_collate_fn
-# 실제 모델 클래스와 설정 파일을 임포트하세요 (파일 이름에 맞춰 수정)
-from src.model import VO 
 
-def test_model_unit():
-    # 1. 테스트용 설정 (로더 테스트와 동일)
-    class Config:
-        proj_home = './'
-        odometry_home = '/home/yskim/projects/vo-labs/data/kitti_odometry/'
-        precomputed_dir = './data/precomputed'
-        color_subdir = 'datasets/sequences/'
-        poses_subdir = 'poses/'
-        calib_subdir = 'datasets/sequences/'
-        traintxt = 'train.txt'
-        trainsequencelist = ['00']
-        
-        # 모델 관련 하이퍼파라미터 예시
-        hidden_dim = 128
-        iters = 8 # DBA 반복 횟수
+def test_calib_slicing():
+    # 1. 실제 상황 설정 (DDP 배치가 1일 때, 전체 프레임은 4개)
+    B_actual = 1
+    num_views = 4
+    total_calib_rows = B_actual * num_views # 결과: 4
+    
+    # 더미 calib 생성 [4, 4] -> 각 행이 [fx, fy, cx, cy]
+    # 각 프레임마다 구분하기 쉽게 fx 값을 다르게 설정
+    # 0번: Lt, 1번: Rt, 2번: Lt1, 3번: Rt1
+    calib = torch.tensor([
+        [450.0, 450.0, 320.0, 240.0], # Lt0 (우리가 필요한 것)
+        [451.0, 451.0, 320.0, 240.0], # Rt0
+        [452.0, 452.0, 320.0, 240.0], # Lt1
+        [453.0, 453.0, 320.0, 240.0]  # Rt1
+    ])
 
-    cfg = Config()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"📡 Testing on device: {device}")
+    print(f"==> Raw Calib Shape: {calib.shape}") # [4, 4]
 
+    # 2. 기존 방식 (에러 발생 원인)
+    focal_wrong = calib[:, 0:1] 
+    print(f"\n[!] 기존 방식 focal shape: {focal_wrong.shape}") 
+    # 결과: [4, 1] -> 노드 배치 1과 맞지 않음 (Expected 1 but got 4)
+
+    # 3. 수정 방식 (Lt 프레임만 정확히 추출)
+    # 4개씩 묶인 데이터에서 첫 번째(Lt)만 가져오기
+    focal_correct = calib[::4, 0:1] 
+    print(f"==> 수정 방식 focal shape: {focal_correct.shape}")
+    print(f"    추출된 fx 값: {focal_correct.squeeze().item()} (Lt0의 fx와 일치해야 함)")
+
+    # 4. 브로드캐스팅 시뮬레이션 (StereoDepthModule 내부)
+    N = 100 # 노드 개수
+    init_disp = torch.randn(B_actual, N, 1) # [1, 100, 1]
+    
+    print(f"\n==> Broadcasting Test:")
     try:
-        # 2. 로더 초기화 (Train 모드 - NPZ 로드)
-        dataset = DataFactory(cfg, mode='train')
-        loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=vo_collate_fn)
-        batch = next(iter(loader))
-        print("배치 데이터 준비 완료")
-
-        # 3. 모델 초기화
-        model = VO(cfg).to(device)
-        model.train() # 학습 모드
-        optimizer = optim.Adam(model.parameters(), lr=1e-4)
-        
-        # 배치 데이터를 GPU로 이동
-        # (딕셔너리 내부의 텐서들을 이동시키는 유틸리티 함수가 있으면 좋습니다)
-        input_data = {
-            'node_features': batch['node_features'].to(device),
-            'edges': batch['edges'].to(device),
-            'edge_attr': batch['edge_attr'].to(device),
-            'masks': batch['masks'].to(device),
-            'intrinsics': batch['clib'].to(device)
-        }
-        gt_pose = batch['rel_pose'].to(device) # [B, 7]
-
-        # 4. Forward Pass
-        print("Forward pass 시작...")
-        pred_pose = model(input_data) # 모델 아웃풋 형태에 따라 수정 필요
-        
-        print(f"Forward 성공! 출력 차원: {pred_pose.shape}")
-
-        # 5. Loss & Backward Pass
-        # 단순 MSE로 먼저 테스트 (나중에 Geodesic Loss 등으로 교체)
-        loss = torch.nn.functional.mse_loss(pred_pose, gt_pose)
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        print(f"Backward 성공! Loss: {loss.item():.6f}")
-        print("\n모델 검사 최종 합격: 데이터 로더부터 역전파까지 정상 작동합니다.")
-
+        # fB_expanded = [1, 1, 1]
+        fB_expanded = focal_correct.unsqueeze(1) 
+        inv_depth = init_disp / (fB_expanded + 1e-6)
+        print(f"    [Success] inv_depth shape: {inv_depth.shape}")
     except Exception as e:
-        print(f"모델 검사 실패: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"    [Failure] 연산 에러: {e}")
+
+    # 5. 여러 배치일 때 테스트 (B=2)
+    print("\n==> Multi-Batch Test (B=2):")
+    calib_B2 = torch.cat([calib, calib + 10], dim=0) # [8, 4]
+    focal_B2 = calib_B2[::4, 0:1] # [2, 1]
+    print(f"    calib_B2 shape: {calib_B2.shape}")
+    print(f"    focal_B2 shape: {focal_B2.shape} (기대값: [2, 1])")
 
 if __name__ == "__main__":
-    test_model_unit()
+    test_calib_slicing()

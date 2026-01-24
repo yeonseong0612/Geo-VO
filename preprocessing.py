@@ -137,12 +137,11 @@ def export_parallel(model, dataloader, save_dir, num_cpu):
                 k = kpts_all[b]     
                 d = desc_all[b]   
                 
-                k_norm = k / torch.tensor([w, h], device=device).float()
                 
                 if d.shape[0] == 256 and d.shape[1] != 256:
                     d = d.transpose(0, 1)
                 
-                node_feat = torch.cat([d, k_norm], dim=-1) 
+                node_feat = d
 
                 # 저장 경로 설정: [시퀀스]/[이미지_사이드]/[000000].npz
                 file_name = f"{int(imgnums[b]):06d}" 

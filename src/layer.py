@@ -5,9 +5,12 @@ from lietorch import SE3
 from torch_geometric.nn import GATv2Conv
 
 class GeometricGAT(nn.Module):
-    def __init__(self, in_channels=256, hidden_channels=256, out_channels=256, heads=4):
+    def __init__(self, in_channels, hidden_channels=256, out_channels=256, heads=4):
         super().__init__()
-        # concat=True 시 out_dim이 hidden_channels이 되도록 조정
+        
+        # 입력 차원과 히든 차원이 다를 경우 Residual을 위해 맞춰주는 레이어
+        self.res_proj = nn.Linear(in_channels, hidden_channels) if in_channels != hidden_channels else nn.Identity()
+
         self.conv1 = GATv2Conv(in_channels, hidden_channels // heads,
                                heads=heads, edge_dim=3)
         self.norm1 = nn.LayerNorm(hidden_channels)
@@ -21,19 +24,19 @@ class GeometricGAT(nn.Module):
 
     def forward(self, x, edge_index, edge_attr):
         # 1st Layer + Residual
-        identity = x
+        identity = self.res_proj(x) # 여기서 차원을 hidden_channels(256)로 강제 일치    
+        
         x = self.conv1(x, edge_index, edge_attr)
         x = self.norm1(x)
         x = self.SiLU(x)
-        x = x + identity # Skip connection
+        x = x + identity # 이제 무조건 256 + 256이 됨
         
         # 2nd Layer + Residual
-        identity = x
-        # return_attention_weights=True는 필요한 경우에만 사용 (메모리 절약)
+        identity = x # 이미 256차원
         x, (edge_index, alpha) = self.conv2(x, edge_index, edge_attr, return_attention_weights=True)
         x = self.norm2(x)
         x = self.SiLU(x)
-        x = x + identity # Skip connection
+        x = x + identity 
         
         x = self.projector(x)
         
@@ -109,48 +112,59 @@ class DBASolver(nn.Module):
         super().__init__()
 
     def forward(self, r, w, J_p, J_d, lmbda):
-        # w: [B, N, 2] -> w[:,:,0]은 Confidence, w[:,:,1]은 추가 Damping으로 해석
-        # r: [B, N, 2], J_p: [B, N, 2, 6], J_d: [B, N, 2, 1]
+        # r: [B, N, 2], w: [B, N, ?], J_p: [B, N, 2, 6], J_d: [B, N, 2, 1]
+        B, N, _ = r.shape
+        device = r.device
         
-        conf = w[..., 0:1].unsqueeze(-1)    # [B, N, 1, 1] (실제 신뢰도)
-        node_lambda = w[..., 1:2]          # [B, N, 1] (노드별 학습된 댐핑)
+        # 1. w 차원 방어 로직 (중요!)
+        # w가 1채널이면 댐핑을 0으로, 2채널이면 2번째 채널 사용
+        conf = w[..., 0:1].unsqueeze(-1)    # [B, N, 1, 1]
+        if w.shape[-1] >= 2:
+            node_lambda = w[..., 1:2]       # [B, N, 1]
+        else:
+            node_lambda = torch.zeros((B, N, 1), device=device)
 
-        # 1. Hessian & Gradient 계산 (Confidence만 적용)
-        H_pp = torch.matmul(J_p.transpose(-1, -2), conf * J_p).sum(dim=1) 
-        H_pd = torch.matmul(J_p.transpose(-1, -2), conf * J_d)           
-        H_dd = torch.matmul(J_d.transpose(-1, -2), conf * J_d).squeeze(-1) 
+        # Hessian & Gradient 계산
+        H_pp = torch.matmul(J_p.transpose(-1, -2), conf * J_p).sum(dim=1) # [B, 6, 6]
+        H_pd = torch.matmul(J_p.transpose(-1, -2), conf * J_d)           # [B, N, 6, 1]
+        H_dd = torch.matmul(J_d.transpose(-1, -2), conf * J_d).squeeze(-1) # [B, N, 1]
 
-        g_p = torch.matmul(J_p.transpose(-1, -2), conf * r.unsqueeze(-1)).sum(dim=1)  
+        g_p = torch.matmul(J_p.transpose(-1, -2), conf * r.unsqueeze(-1)).sum(dim=1) 
         g_d = torch.matmul(J_d.transpose(-1, -2), conf * r.unsqueeze(-1)).squeeze(-1) 
 
-        # 2. Levenberg-Marquardt Damping 적용
-        # 포즈 전체에 글로벌 lmbda 적용
-        H_pp = H_pp + lmbda * torch.eye(6, device=H_pp.device).unsqueeze(0)
+        # 2. Levenberg-Marquardt Damping 적용 (에러 수정 지점)
+        # lmbda가 스칼라이므로 그냥 더해줘도 브로드캐스팅 됩니다.
+        # 또는 lmbda.item()을 사용하거나 lmbda 자체를 활용합니다.
+        diag_mask = torch.eye(6, device=device).unsqueeze(0) # [1, 6, 6]
+        H_pp = H_pp + (lmbda * diag_mask) 
         
-        # 깊이에는 (글로벌 lmbda + 노드별 학습된 lmbda) 적용 -> 이게 2채널의 진정한 힘
-        # node_lambda는 SafeWeightHead에서 0.05~1.0 사이로 나오므로 수치적으로 매우 안전함
+        # H_dd: [B, N, 1], lmbda: 스칼라, node_lambda: [B, N, 1]
         H_dd = H_dd + lmbda + node_lambda
 
-        # 3. Schur Complement
-        inv_H_dd = 1.0 / (H_dd + 1e-4) # eps 상향 조정
-        H_pd_invHdd = H_pd * inv_H_dd.unsqueeze(-1)
+        # 3. Schur Complement 및 inv_H_dd 계산
+        inv_H_dd = 1.0 / (H_dd + 1e-6)
+        H_pd_invHdd = H_pd * inv_H_dd.unsqueeze(-1) # [B, N, 6, 1]
 
+        # H_eff = H_pp - sum(H_pd * inv_H_dd * J_pd^T)
         H_eff = H_pp - torch.matmul(H_pd_invHdd, H_pd.transpose(-1, -2)).sum(dim=1)
-        H_eff = 0.5 * (H_eff + H_eff.transpose(-1, -2))
+        H_eff = 0.5 * (H_eff + H_eff.transpose(-1, -2)) # 대칭성 강제 보장
         
-        g_eff = g_p - (H_pd_invHdd * g_d.unsqueeze(-1)).sum(dim=1)
+        # g_eff = g_p - sum(H_pd * inv_H_dd * g_d)
+        g_eff = g_p - (H_pd_invHdd * g_d.unsqueeze(-1)).sum(dim=1) # [B, 6, 1]
 
-        # 4. 선형 시스템 풀기
+        # 4. 선형 시스템 풀기 (H_eff * delta_pose = g_eff)
         eps_ridge = 1e-3
-        diag_idx = torch.arange(6, device=H_eff.device)
-        H_eff[:, diag_idx, diag_idx] += eps_ridge
+        H_eff = H_eff + eps_ridge * torch.eye(6, device=device).unsqueeze(0)
         
         try:
-            delta_pose = torch.linalg.solve(H_eff, g_eff)
-        except torch._C._LinAlgError:
+            delta_pose = torch.linalg.solve(H_eff, g_eff) # [B, 6, 1]
+        except RuntimeError: # linalg error 처리
             delta_pose = torch.zeros_like(g_eff)
 
         # 5. 최종 delta_depth 계산
+        # v = H_pd^T * delta_pose
+        # H_pd.transpose(-1, -2): [B, N, 1, 6], delta_pose: [B, 6, 1]
+        # v: [B, N, 1, 1] -> squeeze -> [B, N, 1]
         v = torch.matmul(H_pd.transpose(-1, -2), delta_pose.unsqueeze(1)).squeeze(-1)
         delta_depth = inv_H_dd * (g_d - v)
 
@@ -190,15 +204,12 @@ class GraphUpdateBlock(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # 1. Geometric GAT (입력: e_proj(2) + f_Lt(256) = 258)
-        self.spatial_gat = GeometricGAT(in_channels=258, out_channels=hidden_dim)
+        self.spatial_gat = GeometricGAT(in_channels=768, out_channels=hidden_dim)
         self.norm_gat = nn.LayerNorm(hidden_dim)
         
-        # 2. GRU 블록
         self.gru = nn.GRUCell(input_size=hidden_dim, hidden_size=hidden_dim)
         self.norm_h = nn.LayerNorm(hidden_dim)
         
-        # 3. 통합된 Weight Head (Confidence & Scale)
         self.weight_head = nn.Sequential(
             nn.Linear(hidden_dim, 256),
             nn.LayerNorm(256),
@@ -225,21 +236,13 @@ class GraphUpdateBlock(nn.Module):
         nn.init.constant_(self.weight_head[-1].bias, 0.0) 
         nn.init.xavier_normal_(self.weight_head[-1].weight, gain=0.01)
 
-    def forward(self, h, e_proj, f_Lt, edges, edge_attr):
-        """
-        h: [B, N, D] (이전 GRU 히든 스테이트)
-        e_proj: [B, N, 2] (에러 투영값)
-        f_Lt: [B, N, D] (시각 특징)
-        edges: list of tensors or a single tensor
-        edge_attr: list of tensors
-        """
-        B, N, D = f_Lt.shape
-        device = f_Lt.device
+    def forward(self, h, flow_res, x_fused, edges, edge_attr):
+        B, N, D = x_fused.shape
+        device = x_fused.device
 
         # --- 1. 입력 준비 ---
-        x = torch.cat([e_proj, f_Lt], dim=-1) # [B, N, 258]
-        x_flat = x.reshape(-1, x.size(-1))    # [BN, 258]
-        
+        x = x_fused 
+        x_flat = x.reshape(-1, x.size(-1)) # [BN, 256]
         # --- 2. 그래프 데이터 병합 (GPU 병목 최적화) ---
         # 매번 루프에서 tensor() 생성을 피하기 위해 미리 텐서인 경우만 처리
         flat_edges_list = []
@@ -256,12 +259,12 @@ class GraphUpdateBlock(nn.Module):
         x_spatial = self.norm_gat(x_spatial) # 수치 안정화용 노름
 
         # --- 4. GRU 연산 (히스토리 반영) ---
-        h_flat_in = x_spatial.reshape(-1, D)
-        h_prev_flat = h.reshape(-1, D)
+        h_flat_in = x_spatial.reshape(-1, self.hidden_dim) 
+        h_prev_flat = h.reshape(-1, self.hidden_dim)
         
         h_new_flat = self.gru(h_flat_in, h_prev_flat)
         h_new = h_new_flat.view(B, N, -1)
-        h_new = self.norm_h(h_new) # 히든 스테이트 정규화
+        h_new = self.norm_h(h_new)
 
         # --- 5. Heads 출력 ---
         r = self.residual_head(h_new) 
@@ -291,13 +294,20 @@ class EpipolarCrossAttention(nn.Module):
         self.v_proj = nn.Linear(feature_dim, feature_dim)
         self.merge = nn.Linear(feature_dim, feature_dim)
 
-    def forward(self, nodes_L, nodes_R, kpts_L, kpts_R):
+    def forward(self, nodes_L, nodes_R, kpts_L, kpts_R, return_attn=True):
         """
         nodes_L: [B, N, C]
         nodes_R: [B, M, C]
         kpts_L: [B, N, 2]
         kpts_R: [B, M, 2]
         """
+        # --- 차원 방어 시작 ---
+        if nodes_L.dim() == 2:
+            nodes_L = nodes_L.unsqueeze(0) # [N, C] -> [1, N, C]
+            nodes_R = nodes_R.unsqueeze(0)
+            kpts_L = kpts_L.unsqueeze(0)   # [N, 2] -> [1, N, 2]
+            kpts_R = kpts_R.unsqueeze(0)
+        # --- 차원 방어 끝 ---
         B, N, C = nodes_L.shape
         M = nodes_R.shape[1]
 
@@ -328,12 +338,14 @@ class EpipolarCrossAttention(nn.Module):
         init_disparity = torch.sum(attn_weights * dist_u, dim=-1, keepdim=True) # [B, N, 1]
         confidence = mask.any(dim=-1, keepdim=True).float()
 
-        return self.merge(matched_features), init_disparity, confidence
-    
+        out = self.merge(matched_features)
+        if return_attn:
+            return out, init_disparity, confidence, attn_weights
+        return out, init_disparity, confidence   
+     
 class StereoDepthModule(nn.Module):
-    def __init__(self, focal_length, baseline, feature_dim):
+    def __init__(self, feature_dim):
         super().__init__()
-        self.fB = focal_length * baseline
         # 기하학적 정보를 위한 작은 인코더 추가
         self.geo_enc = nn.Sequential(
             nn.Linear(feature_dim + 2, 64),
@@ -341,25 +353,48 @@ class StereoDepthModule(nn.Module):
             nn.Linear(64, 32)
         )
 
-    def forward(self, nodes_L, matched_features, init_disp, confidence):
-        inv_depth = torch.clamp(init_disp / (self.fB + 1e-6), min=0.01, max=10.0)
-        depth = 1.0 / (inv_depth + 1e-6)
+    def forward(self, nodes_L, matched_features, init_disp, confidence, intrinsics, baseline):
+        """
+        intrinsics: [B, 4] (fx, fy, cx, cy)
+        baseline: 스칼라 (예: 0.54m)
+        """
+        B, N, _ = nodes_L.shape
         
+        # 1. fx 추출 (intrinsics의 첫 번째 열)
+        fx = intrinsics[:, 0:1] # [B, 1]
+        fB = fx * baseline      # [B, 1]
+        
+        # 2. 브로드캐스팅을 위한 확장 [B, 1, 1]
+        fB_expanded = fB.unsqueeze(-1) 
+        
+        # 3. Disparity를 Inverse Depth로 변환 (안전한 나눗셈)
+        # fB / depth = disparity -> 1 / depth = disparity / fB
+        inv_depth = torch.clamp(init_disp / (fB_expanded + 1e-8), min=1e-4, max=1.0)
+        depth = 1.0 / (inv_depth + 1e-8)
+        
+        # 4. 특징 융합 (Visual + Geometric)
+        # geo_input: [B, N, C + 1(inv_depth) + 1(confidence)]
         geo_input = torch.cat([nodes_L, inv_depth, confidence], dim=-1)
-        geo_feat = self.geo_enc(geo_input) # 시각 맥락이 반영된 기하 특징
+        geo_feat = self.geo_enc(geo_input) # [B, N, 32]
         
+        # 최종 특징량: 원본 + 매칭된 상대 특징 + 기하학적 깊이 특징
         updated_nodes = torch.cat([nodes_L, matched_features, geo_feat], dim=-1)
+        
         return updated_nodes, depth
     
 class TemporalCrossAttention(nn.Module):
-    def __init__(self, feature_dim):
+    def __init__(self, q_dim, kv_dim):
         super().__init__()
-        self.dim = feature_dim
+        self.q_dim = q_dim   # 544 (v_stereo_feat)
+        self.kv_dim = kv_dim # 256 (f_Lt1)
         
-        self.q_proj = nn.Linear(feature_dim, feature_dim)
-        self.k_proj = nn.Linear(feature_dim, feature_dim)
-        self.v_proj = nn.Linear(feature_dim, feature_dim)
-        self.merge = nn.Linear(feature_dim, feature_dim)
+        # Query는 544에서 변환
+        self.q_proj = nn.Linear(q_dim, 256) # 결과는 256으로 통일
+        # Key, Value는 256에서 변환
+        self.k_proj = nn.Linear(kv_dim, 256)
+        self.v_proj = nn.Linear(kv_dim, 256)
+        
+        self.merge = nn.Linear(256, 256)
         self.temp_geo_enc = nn.Sequential(
             nn.Linear(3, 32), # flow_residual(2) + confidence(1)
             nn.SiLU(),
@@ -374,6 +409,13 @@ class TemporalCrossAttention(nn.Module):
         kpts_t1_actual: [B, M, 2]
         iter_idx: int
         """
+        # --- 차원 방어 시작 ---
+        if nodes_t.dim() == 2:
+            nodes_t = nodes_t.unsqueeze(0)
+            nodes_t1 = nodes_t1.unsqueeze(0)
+            kpts_t1_pred = kpts_t1_pred.unsqueeze(0)
+            kpts_t1_actual = kpts_t1_actual.unsqueeze(0)
+        # --- 차원 방어 끝 ---
         B, N, C = nodes_t.shape
         M = nodes_t1.shape[1]
 
@@ -399,7 +441,7 @@ class TemporalCrossAttention(nn.Module):
 
         # 4. Batch Matrix Multiplication (BMM)
         # Q: [B, N, C], K.transpose(1, 2): [B, C, M]
-        attn = torch.matmul(Q, K.transpose(1, 2)) / (self.dim ** 0.5) # [B, N, M]
+        attn = torch.matmul(Q, K.transpose(1, 2)) / (256 ** 0.5)
         attn = attn.masked_fill(~mask, -1e9)
         attn_weights = F.softmax(attn, dim=-1)      # [B, N, M]
 
