@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from lietorch import SE3
 from torch_geometric.nn import GATv2Conv
 
@@ -288,3 +289,112 @@ class SafeWeightHead(nn.Module):
         )
     def forward(self, x):
         return self.net(x) * 0.95 + 0.05
+    
+
+class EpipolarCrossAttention(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.dim = feature_dim
+        # self.heads = heads
+        
+        self.q_proj = nn.Linear(feature_dim, feature_dim)
+        self.k_proj = nn.Linear(feature_dim, feature_dim)
+        self.v_proj = nn.Linear(feature_dim, feature_dim)
+
+        self.merge = nn.Linear(feature_dim, feature_dim)
+
+    def forward(self, nodes_L, nodes_R, kpts_L, kpts_R):
+        """
+        nodes_L: [N, C] (Left 이미지 노드 특징)
+        nodes_R: [M, C] (Right 이미지 노드 특징)
+        kpts_L: [N, 2] (u, v 좌표)
+        kpts_R: [M, 2] (u, v 좌표)
+        """
+
+        N = nodes_L.shape[0]
+
+        Q = self.q_proj(nodes_L)  # [N, C]
+        K = self.k_proj(nodes_R)  # [M, C]
+        V = self.v_proj(nodes_R)  # [M, C]
+
+        # --- 에피폴라 제약 설정 ---
+        dist_v = torch.abs(kpts_L[:, 1:2] - kpts_R[:, 1].unsqueeze(0)) # Y축 차이
+        dist_u = kpts_L[:, 0:1] - kpts_R[:, 0].unsqueeze(0)            # X축 차이 (Disparity)
+        mask = (dist_v < 3.0) & (dist_u > 0) & (dist_u < 192)
+
+        attn = torch.matmul(Q, K.transpose(0,1)) / (self.dim ** 0.5)   # [N, M]
+        attn = attn.masked_fill(~mask, -1e9)
+        attn_weights = F.softmax(attn, dim=-1)                          # [N, M]
+        matched_features = torch.matmul(attn_weights, V)                # [N, C]
+        # Soft-Argmax 스타일로 초기 Disparity(시차) 계산
+        # u_L - u_R 값들을 가중평균
+        init_disparity = torch.sum(attn_weights * dist_u, dim=-1, keepdim=True) # [N, 1]
+        confidence = mask.any(dim=-1, keepdim=True).float()
+
+        return self.merge(matched_features), init_disparity, confidence
+    
+class StereoDepthModule(nn.Module):
+    def __init__(self,  focal_length, baseline):
+        super().__init__()
+        self.fB = focal_length * baseline
+
+    def forward(self, nodes_L, matched_features, init_disp, confidence):
+        '''
+        nodes_L : [N, C] 원본 특징
+        matched_features : [N, C] 어텐션으로 가져온 스테레오 특징
+        init_disp : [N, 1] 계산된 시차
+        confidence : [N, 1] 매칭 신뢰도
+        '''
+        depth = self.fB / (init_disp + 1e-6)
+        inv_depth = 1.0 / (depth + 1e-6)
+        # 원본 정보 + 스테레오 문맥 정보 + 기하학적 정보(깊이, 신뢰도)
+        updated_nodes = torch.cat([nodes_L, matched_features, inv_depth, confidence], dim=-1) # [N, C + C + 2]
+
+        return updated_nodes, depth
+    
+class TemporalCrossAttention(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.dim = feature_dim
+        
+        self.q_proj = nn.Linear(feature_dim, feature_dim)
+        self.k_proj = nn.Linear(feature_dim, feature_dim)
+        self.v_proj = nn.Linear(feature_dim, feature_dim)
+
+        self.merge = nn.Linear(feature_dim, feature_dim)
+
+    def forward(self, nodes_t, nodes_t1, kpts_t1_pred, kpts_t1_actual, iter_idx):
+        """
+        nodes_t: [N, C] (L_t 노드 특징)
+        nodes_t1: [M, C] (L_t1 노드 특징 후보군)
+        kpts_t1_pred: [N, 2] (현재 포즈 가설로 투영된 예상 위치)
+        kpts_t1_actual: [M, 2] (L_t1에서 실제 추출된 특징점 좌표)
+        iter_idx: int (현재 루프 횟수, 0이면 루프 진입 전)
+        """
+        N = nodes_t.shape[0]
+        if iter_idx == 0:
+            win_size = 64.0
+        else:
+            win_size = max(4.0, 32.0 / (2 ** (iter_idx - 1)))
+        
+        Q = self.q_proj(nodes_t)   # [N, C]
+        K = self.k_proj(nodes_t1)  # [M, C]
+        V = self.v_proj(nodes_t1)  # [M, C]
+
+        dist_u = torch.abs(kpts_t1_pred[:, 0:1] - kpts_t1_actual[:, 0].unsqueeze(0))
+        dist_v = torch.abs(kpts_t1_pred[:, 1:2] - kpts_t1_actual[0, 1].unsqueeze(0))
+
+        mask = (dist_u < win_size) & (dist_v < win_size)
+
+        attn = torch.matmul(Q, K.transpose(0, 1)) / (self.dim ** 0.5)
+        attn = attn.masked_fill(~mask, -1e9)
+        attn_weights = F.softmax(attn, dim=-1)      # [N, M]
+
+        matched_features = torch.matmul(attn_weights, V)    #[N, C]
+        matched_kpts = torch.matmul(attn_weights, kpts_t1_actual) # [N, 2]
+
+        flow_residual = matched_kpts - kpts_t1_pred
+
+        confidence = mask.any(dim=-1, keepdim=True).float()
+
+        return self.merge(matched_features), flow_residual, confidence

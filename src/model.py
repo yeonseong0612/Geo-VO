@@ -11,13 +11,19 @@ class VO(nn.Module):
         super().__init__()
         self.extractor = SuperPointExtractor()
         self.DT = compute_delaunay_edges
+
+        self.stereo_matcher = EpipolarCrossAttention(feature_dim=256)
+        self.temporal_matcher = TemporalCrossAttention(feature_dim=256)
+
         self.GAT = GeometricGAT(in_channels=258, out_channels=256)
         self.cyclic_module = CyclicErrorModule(cfg.baseline)       
         self.update_block = GraphUpdateBlock(hidden_dim=256)
-        self.init_depth_net = nn.Linear(256, 1)
+        
         self.DBA = DBASolver()
         self.DBA_Updater = PoseDepthUpdater()
         self.log_lmbda = nn.Parameter(torch.tensor(-4.6))
+        self.baseline = cfg.baseline
+        self.focal = cfg.focal
 
     def forward(self, batch, iters=8, gt_guide=None):
         device = self.log_lmbda.device
@@ -81,52 +87,97 @@ class VO(nn.Module):
         refined_desc_all, _ = self.GAT(node_feats.reshape(-1, D), edges_combined, edge_attr_combined)
         refined_desc_all = refined_desc_all.view(B_total, N, -1)
 
-        # --- Iterative Update Loop 준비 ---
         refined_desc_all = refined_desc_all.view(B, 4, -1, 256)
         kpts_all = kpts_all.view(B, 4, -1, 2)
         
-        f_Lt = refined_desc_all[:, 0]
-        kpts_Lt = kpts_all[:, 0]
+        f_Lt, kpts_Lt = refined_desc_all[:, 0], kpts_all[:, 0]
+        f_Rt, kpts_Rt = refined_desc_all[:, 1], kpts_all[:, 1]
+        f_Lt1, kpts_Lt1 = refined_desc_all[:, 2], kpts_all[:, 2]
+
+        # --- [2] Stereo Initialization (루프 진입 전 핵심!) ---
+        # 5.0 고정값 대신 스테레오 매칭을 통해 실제 거리를 측정합니다.
+        _, init_disp, _ = self.stereo_matcher(f_Lt, f_Rt, kpts_Lt, kpts_Rt)
+        
+        # d = (f * B) / disparity
+        curr_depth = (self.focal * self.baseline) / (init_disp + 1e-6)
+        curr_depth = torch.clamp(curr_depth, min=0.1, max=100.0) # 안전장치
         
         curr_pose = SE3.Identity(B, device=device)
-        curr_depth = torch.ones((B, N, 1), device=device) * 5.0
-        h = torch.zeros((B, N, 256), device=device)
+        h = torch.zeros((B, kpts_Lt.shape[1], 256), device=device)
 
-        poses_history = []
-        weights_history = []
-        errors_history = []
+        # --- [3] Iteration 0: Initial Temporal Look ---
+        # 루프 시작 전, 현재(정지) 가설로 Lt -> Lt1 오차를 먼저 확인합니다.
+        kpts_t1_pred = project_kpts(kpts_Lt, curr_depth, curr_pose, calib)
+        _, flow_res, conf_t = self.temporal_matcher(f_Lt, f_Lt1, kpts_t1_pred, kpts_Lt1, iter_idx=0)
 
+        poses_history, weights_history, errors_history = [], [], []
+
+        # --- [4] Iterative Update Loop ---
         for i in range(iters):
-            # -------------------------------------------------------
-            # [수정] Iteration 0에서 GT 가이드(Teacher Forcing) 주입
-            # -------------------------------------------------------
             if i == 0 and gt_guide is not None:
                 curr_pose = SE3.InitFromVec(gt_guide)
-            # -------------------------------------------------------
 
-            # 1. 4장 이미지 순환 투영 에러 계산
-            e_proj = self.cyclic_module(kpts_Lt, curr_depth, curr_pose, calib)
+            # 1. GAT + GRU 업데이트
+            # flow_res(매칭 오차)와 엣지 정보를 GAT가 분석하여 GRU에 전달
+            h, r, w, a_p, a_d = self.update_block(h, flow_res, f_Lt, edges_list, edge_attr_list) 
             
-            # 2. 업데이트 블록 (GAT + GRU)
-            # h: hidden state, r: residual, w: confidence weight
-            h, r, w, a_p, a_d = self.update_block(h, e_proj, f_Lt, edges_list, edge_attr_list) 
-            
-            # 3. 미분 기반 최적화 (DBA)
+            # 2. 미분 기반 최적화 (DBA)
             J_p, J_d = compute_projection_jacobian(kpts_Lt, curr_depth, calib)
             lmbda = torch.exp(self.log_lmbda)
-            
             delta_pose_dba, delta_depth_dba = self.DBA(r, w, J_p, J_d, lmbda)
             
-            # 4. 포즈 및 깊이 업데이트 (학습된 보폭 alpha 반영)
+            # 3. 포즈 및 깊이 업데이트
             curr_pose, curr_depth = self.DBA_Updater(curr_pose, curr_depth, delta_pose_dba, delta_depth_dba, a_p, a_d)
+
+            # 4. Adaptive Temporal Matching (다음 루프를 위한 매칭 갱신)
+            # 업데이트된 포즈로 다시 투영하고, 윈도우를 줄여가며 정밀 매칭 수행
+            kpts_t1_pred = project_kpts(kpts_Lt, curr_depth, curr_pose, calib)
+            _, flow_res, conf_t = self.temporal_matcher(f_Lt, f_Lt1, kpts_t1_pred, kpts_Lt1, iter_idx=i+1)
 
             poses_history.append(curr_pose)
             weights_history.append(w)
-            errors_history.append(e_proj)
+            errors_history.append(flow_res)
 
-        # SE3 객체 형태로 패킹하여 반환
-        poses_h = SE3(torch.stack([p.data for p in poses_history]))
-        weights_h = torch.stack(weights_history) 
-        errors_h = torch.stack(errors_history) 
-        
-        return (poses_h, weights_h, errors_h)
+        return (SE3(torch.stack([p.data for p in poses_history])), torch.stack(weights_history), torch.stack(errors_history))
+    
+def project_kpts(kpts_t0, depth_t0, pose_t0t1, calib):
+    """
+    kpts_t0: [B, N, 2] - 현재 프레임의 2D 특징점 (u, v)
+    depth_t0: [B, N, 1] - 현재 프레임의 깊이 (Z)
+    pose_t0t1: lietorch.SE3 객체 - t0에서 t1으로의 상대 포즈 변화
+    calib: [B, 4] - 카메라 내상수 [fx, fy, cx, cy]
+    """
+    B, N, _ = kpts_t0.shape
+    device = kpts_t0.device
+    
+    fx, fy, cx, cy = calib[:, 0:1], calib[:, 1:2], calib[:, 2:3], calib[:, 3:4]
+
+    # 1. 2D 픽셀 좌표 -> 3D 카메라 좌표계 (Back-projection)
+    # x = (u - cx) * Z / fx
+    # y = (v - cy) * Z / fy
+    u, v = kpts_t0[..., 0:1], kpts_t0[..., 1:2]
+    x = (u - cx.unsqueeze(1)) * depth_t0 / fx.unsqueeze(1)
+    y = (v - cy.unsqueeze(1)) * depth_t0 / fy.unsqueeze(1)
+    z = depth_t0
+    
+    pts_3d_t0 = torch.cat([x, y, z], dim=-1) # [B, N, 3]
+
+    # 2. SE3 포즈 변환 (t0 좌표계 -> t1 좌표계)
+    # lietorch의 SE3 객체는 [B, N, 3] 형태의 포인트 클라우드 변환을 지원합니다.
+    # pose_t0t1가 [B] 크기라면 노드 개수(N)만큼 확장해서 적용해야 할 수도 있습니다.
+    pts_3d_t1 = pose_t0t1.unsqueeze(1) * pts_3d_t0 # [B, N, 3]
+
+    # 3. 3D 카메라 좌표계 -> 2D 픽셀 좌표계 (Projection)
+    # u' = x' * fx / z' + cx
+    # v' = y' * fy / z' + cy
+    x1, y1, z1 = pts_3d_t1[..., 0:1], pts_3d_t1[..., 1:2], pts_3d_t1[..., 2:3]
+    
+    # zero-division 방지
+    z1 = torch.clamp(z1, min=0.1)
+    
+    u1 = (x1 * fx.unsqueeze(1) / z1) + cx.unsqueeze(1)
+    v1 = (y1 * fy.unsqueeze(1) / z1) + cy.unsqueeze(1)
+    
+    kpts_t1_pred = torch.cat([u1, v1], dim=-1) # [B, N, 2]
+    
+    return kpts_t1_pred

@@ -46,7 +46,7 @@ def weight_reg_loss(weight_history, reproj_errors, gamma=0.8):
     n_iters = weight_history.shape[0]
     
     huber_err = F.huber_loss(reproj_errors, torch.zeros_like(reproj_errors), 
-                             reduction='none', delta=0.5)
+                             reduction='none', delta=1.0)
     
     weighted_err = (weight_history * huber_err).mean(dim=(1, 2, 3))
     
