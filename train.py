@@ -80,10 +80,11 @@ def train(rank, world_size, cfg):
             sampler.set_epoch(epoch)
         
         model.train()
-        # --- 지표 누적을 위한 변수 초기화 ---
+        # --- 지표 누적 변수 초기화 (l_w 추가) ---
         epoch_loss = 0.0
         epoch_t_err = 0.0
         epoch_r_err = 0.0
+        epoch_l_w = 0.0
         
         pbar = tqdm(loader, desc=f"Epoch {epoch}", disable=(rank != 0))
         
@@ -91,45 +92,50 @@ def train(rank, world_size, cfg):
             optimizer.zero_grad()
             
             gt_pose = batch['rel_pose'].to(device)
-            noise = torch.randn_like(gt_pose) * 0.01 
-            gt_guide_pose = gt_pose + noise
+            
+            # 모델 호출 (iters는 학습 안정성을 위해 8~12 사이 추천)
+            outputs = model(batch, iters=8) 
 
-            outputs = model(batch, iters=12, gt_guide=None)
-
+            # total_loss 호출 (딕셔너리 형태의 outputs 전달)
             loss, t_err, r_err, l_w = total_loss(outputs, gt_pose)
             
+            if torch.isnan(loss):
+                print(f"\n[Rank {rank}] Warning: NaN loss detected. Skipping batch {i}.")
+                continue
+
             loss.backward()
+            
+            # Gradient Clipping (VO 발산 방지의 핵심 가드레일)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            # 현재 람다 값 모니터링
-            curr_lmbda = torch.exp(raw_model.log_lmbda).item()
-
-            # --- 지표 누적 및 평균 계산 ---
+            # --- 지표 누적 및 평균 계산 (item() 적극 사용으로 메모리 누수 방지) ---
             epoch_loss += loss.item()
             epoch_t_err += t_err
             epoch_r_err += r_err
+            epoch_l_w += l_w.item() if torch.is_tensor(l_w) else l_w
             
+            # 실시간 평균값 계산
             avg_loss = epoch_loss / (i + 1)
             avg_t_err = epoch_t_err / (i + 1)
             avg_r_err = epoch_r_err / (i + 1)
+            avg_l_w = epoch_l_w / (i + 1)
+
+            curr_lmbda = torch.exp(raw_model.log_lmbda).item()
 
             if rank == 0:
-                # 진행 바에는 실시간 평균값을 표시
                 pbar.set_postfix({
-                    "AvgL": f"{avg_loss:.3f}", 
-                    "AvgT": f"{avg_t_err:.3f}", 
-                    "AvgR": f"{avg_r_err:.3f}",
+                    "L": f"{avg_loss:.3f}", 
+                    "T": f"{avg_t_err:.3f}m", 
+                    "R": f"{avg_r_err:.3f}rad",
                     "Lm": f"{curr_lmbda:.1e}"
                 })
 
                 global_step = epoch * len(loader) + i
                 writer.add_scalar('Batch/Loss', loss.item(), global_step)
                 writer.add_scalar('Batch/Trans_Err', t_err, global_step)
-                writer.add_scalar('Batch/Rot_Err', r_err, global_step)
-                writer.add_scalar('Batch/Weight_Loss', l_w, global_step)
                 writer.add_scalar('Batch/Lambda', curr_lmbda, global_step)
-
+        # 에포크 종료 후 스케줄러 업데이트
         scheduler.step()
 
         if rank == 0:

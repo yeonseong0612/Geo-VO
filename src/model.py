@@ -9,136 +9,113 @@ from utils.DBA_utils import *
 class VO(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        self.cfg = cfg
         self.extractor = SuperPointExtractor()
-        self.DT = compute_delaunay_edges
+        self.DT = compute_delaunay_edges  # Delaunay Triangulation
 
+        # 1. 시각 및 기하 매칭 모듈
         self.stereo_matcher = EpipolarCrossAttention(feature_dim=256)
         self.temporal_matcher = TemporalCrossAttention(feature_dim=256)
+        
+        # 2. 깊이 초기화 및 특징 융합 (우리가 설계한 핵심!)
+        self.stereo_depth_mod = StereoDepthModule(cfg.focal, cfg.baseline, feature_dim=256)
+        self.geo_bottleneck = GeometricBottleneck(visual_dim=768, geo_dim=64, out_dim=256)
 
-        self.GAT = GeometricGAT(in_channels=258, out_channels=256)
-        self.cyclic_module = CyclicErrorModule(cfg.baseline)       
+        # 3. 그래프 최적화 및 업데이트 블록
+        # Bottleneck을 거쳐 256차원으로 고정된 입력을 받습니다.
         self.update_block = GraphUpdateBlock(hidden_dim=256)
         
+        # 4. 수치적 솔버
         self.DBA = DBASolver()
-        self.DBA_Updater = PoseDepthUpdater()
-        self.log_lmbda = nn.Parameter(torch.tensor(-4.6))
-        self.baseline = 0.54
+        self.DBA_Updater = PoseDepthUpdater(min_depth=0.1, max_depth=100.0)
+        self.log_lmbda = nn.Parameter(torch.tensor(-4.6)) # 초기 댐핑 lmbda = 0.01
 
     def forward(self, batch, iters=8, gt_guide=None):
+        """
+        [Inputs]
+        - batch: 데이터셋에서 제공하는 dict
+            - 'images': [B, 4, 1, H, W] (Lt, Rt, Lt1, Rt1 순서)
+            - 'calib': [B, 4] (fx, fy, cx, cy)
+            - 'node_features': (Train 전용) 미리 추출된 특징 [B, 4, N, 256]
+            - 'kpts': (Train 전용) 미리 추출된 좌표 [B, 4, N, 2]
+        - iters: 반복 최적화 횟수 (기본 8회)
+        - gt_guide: (Optional) 초기 포즈 가이드 [B, 7]
+        """
         device = self.log_lmbda.device
         calib = batch['calib'].to(device)
         B = calib.shape[0]
-        focal_batch = calib[:, 0:1] # [B, 1]
-
-        # --- feature and descriptor extraction ---
+        
+        # --- [Step 1] Feature & Graph Extraction ---
         if self.training:
-            node_feats = batch['node_features'].to(device)
-            edges_list = batch['edges']      
-            edge_attr_list = batch['edge_attr'] 
-            kpts_all = batch['kpts'].to(device)
-            B_total, N, D = node_feats.shape 
-        else:
-            images = batch['images'].to(device)
-            B, V, C, H, W = images.shape
-            images_flat = images.view(B*V, C, H, W)
-            kpts_all, desc_all = self.extractor(images_flat)
-            
-            all_edges = []
-            all_edge_attrs = []
-            kpts_np = kpts_all.detach().cpu().numpy()
-            
-            for i in range(B * V):
-                edge_np = self.DT(kpts_np[i])
-                edge_torch = torch.from_numpy(edge_np).to(device).long()
-                src_pts = kpts_all[i][edge_torch[0]]
-                dst_pts = kpts_all[i][edge_torch[1]]
-                
-                # [에피폴라 힌트] y축 차이가 적을수록 매칭 확률이 높음을 인코딩
-                diff = src_pts - dst_pts 
-                dist = torch.norm(diff, dim=1, keepdim=True)
-                attr = torch.cat([dist, diff], dim=1) 
-                
-                all_edges.append(edge_torch)
-                all_edge_attrs.append(attr)
-            
-            edges_list = all_edges
-            edge_attr_list = all_edge_attrs
-            size_tensor = torch.tensor([W, H], device=device).view(1, 1, 2)
-            desc_ready = desc_all.transpose(1, 2) if desc_all.shape[1] == 256 else desc_all
-            node_feats = torch.cat([desc_ready, kpts_all / size_tensor], dim=-1)
-            B_total = B * V
-            N = node_feats.shape[1]
-            D = node_feats.shape[2]
+            # 학습 모드: 연산 속도를 위해 전처리된 특징 사용
+            node_feats_all = batch['node_features'].to(device) # [B, 4, N, 256]
+            kpts_all = batch['kpts'].to(device)               # [B, 4, N, 2]
+            edges_list = batch['edges']                        # Delaunay 에지 리스트
+            edge_attr_list = batch['edge_attr']                # 에지 속성 리스트
+        # else:
+        #     # 추론 모드: 원본 이미지로부터 실시간 추출
+        #     images = batch['images'].to(device) # [B, 4, 1, H, W]
+        #     B, V, _, H, W = images.shape
+        #     # SuperPoint 등을 통한 특징점 및 디스크립터 추출 로직 (생략/유지)
+        #     kpts_all, node_feats_all, edges_list, edge_attr_list = self.extractor(images)
 
-        # --- GAT 기반 특징 정교화 (Epipolar-aware) ---
-        flat_edges_list = []
-        flat_attr_list = []
-        for i in range(B_total):
-            e = edges_list[i].to(device)
-            flat_edges_list.append(e + i * N)
-            
-            # [에피폴라 힌트 주입] y축 차이가 0인 엣지에 가중치를 줌
-            a = edge_attr_list[i].to(device)
-            flat_attr_list.append(a)
-        
-        edges_combined = torch.cat(flat_edges_list, dim=1)
-        edge_attr_combined = torch.cat(flat_attr_list, dim=0)
+        # 4개 프레임 분리 (Lt: 현재, Rt: 현재 우측, Lt1: 다음 프레임)
+        f_Lt, kpts_Lt = node_feats_all[:, 0], kpts_all[:, 0]
+        f_Rt, kpts_Rt = node_feats_all[:, 1], kpts_all[:, 1]
+        f_Lt1, kpts_Lt1 = node_feats_all[:, 2], kpts_all[:, 2]
 
-        refined_desc_all, _ = self.GAT(node_feats.reshape(-1, D), edges_combined, edge_attr_combined)
-        refined_desc_all = refined_desc_all.view(B_total, N, -1)
+        # --- [Step 2] Stereo Initialization (Initial Depth) ---
+        # 1. Epipolar Attention을 통한 매칭 및 시차 계산
+        f_stereo, init_disp, conf_s = self.stereo_matcher(f_Lt, f_Rt, kpts_Lt, kpts_Rt)
+        
+        # 2. 스테레오 모듈을 통한 초기 깊이 추정 및 기하 특징(s_geo) 생성
+        # nodes_L_up: [B, N, 544], s_geo: [B, N, 32]
+        nodes_L_up, curr_depth = self.stereo_depth_mod(f_Lt, f_stereo, init_disp, conf_s)
 
-        refined_desc_all = refined_desc_all.view(B, 4, -1, 256)
-        kpts_all = kpts_all.view(B, 4, -1, 2)
-        
-        f_Lt, kpts_Lt = refined_desc_all[:, 0], kpts_all[:, 0]
-        f_Rt, kpts_Rt = refined_desc_all[:, 1], kpts_all[:, 1]
-        f_Lt1, kpts_Lt1 = refined_desc_all[:, 2], kpts_all[:, 2]
-
-        # --- [2] Stereo Initialization (루프 진입 전 핵심!) ---
-        # 5.0 고정값 대신 스테레오 매칭을 통해 실제 거리를 측정합니다.
-        _, init_disp, _ = self.stereo_matcher(f_Lt, f_Rt, kpts_Lt, kpts_Rt)
-        
-        # d = (f * B) / disparity
-        curr_depth = (focal_batch.view(B, 1, 1) * self.baseline) / (init_disp + 1e-6)
-        curr_depth = torch.clamp(curr_depth, min=1.0, max=80.0)        
-        
+        # --- [Step 3] Iterative Refinement Loop ---
         curr_pose = SE3.Identity(B, device=device)
-        h = torch.zeros((B, kpts_Lt.shape[1], 256), device=device)
+        h = torch.zeros((B, kpts_Lt.shape[1], 256), device=device) # GRU Hidden State
+        
+        poses_history = []
+        depths_history = []
+        weights_history = []  
 
-        # --- [3] Iteration 0: Initial Temporal Look ---
-        # 루프 시작 전, 현재(정지) 가설로 Lt -> Lt1 오차를 먼저 확인합니다.
-        kpts_t1_pred = project_kpts(kpts_Lt, curr_depth, curr_pose, calib)
-        _, flow_res, conf_t = self.temporal_matcher(f_Lt, f_Lt1, kpts_t1_pred, kpts_Lt1, iter_idx=0)
-
-        poses_history, weights_history, errors_history = [], [], []
-
-        # --- [4] Iterative Update Loop ---
         for i in range(iters):
             if i == 0 and gt_guide is not None:
                 curr_pose = SE3.InitFromVec(gt_guide)
 
-            # 1. GAT + GRU 업데이트
-            # flow_res(매칭 오차)와 엣지 정보를 GAT가 분석하여 GRU에 전달
-            h, r, w, a_p, a_d = self.update_block(h, flow_res, f_Lt, edges_list, edge_attr_list) 
+            # 1. Adaptive Temporal Matching
+            # 현재 예측된 포즈(curr_pose)로 Lt의 점들을 Lt1으로 재투영
+            kpts_t1_pred = project_kpts(kpts_Lt, curr_depth, curr_pose, calib)
             
-            # 2. 미분 기반 최적화 (DBA)
+            # 윈도우 서치를 통해 시간적 매칭 특징 및 기하 특징(t_geo) 생성
+            f_temp, t_geo, flow_res, conf_t = self.temporal_matcher(
+                f_Lt, f_Lt1, kpts_t1_pred, kpts_Lt1, iter_idx=i
+            )
+
+            # 2. Geometric Bottleneck (차원 융합: 768+64 -> 256)
+            # v_feat: [Lt, Stereo, Temporal] 결합
+            v_feat = torch.cat([f_Lt, f_stereo, f_temp], dim=-1) # [B, N, 768]
+            # g_feat: [Stereo_Geo, Temporal_Geo] 결합 (각 32차원 인코딩됨)
+            g_feat = torch.cat([nodes_L_up[..., -32:], t_geo], dim=-1) # [B, N, 64]
+            
+            x_fused = self.geo_bottleneck(v_feat, g_feat) # [B, N, 256]
+
+            # 3. Graph Update Block (GAT + GRU)
+            # x_fused는 이제 수치적으로 매우 안정적인 256차원 공간 인지 벡터입니다.
+            h, r, w, a_p, a_d = self.update_block(h, flow_res, x_fused, edges_list, edge_attr_list) 
+            
+            # 4. DBA Solver & Update
             J_p, J_d = compute_projection_jacobian(kpts_Lt, curr_depth, calib)
             lmbda = torch.exp(self.log_lmbda)
-            delta_pose_dba, delta_depth_dba = self.DBA(r, w, J_p, J_d, lmbda)
             
-            # 3. 포즈 및 깊이 업데이트
-            curr_pose, curr_depth = self.DBA_Updater(curr_pose, curr_depth, delta_pose_dba, delta_depth_dba, a_p, a_d)
-
-            # 4. Adaptive Temporal Matching (다음 루프를 위한 매칭 갱신)
-            # 업데이트된 포즈로 다시 투영하고, 윈도우를 줄여가며 정밀 매칭 수행
-            kpts_t1_pred = project_kpts(kpts_Lt, curr_depth, curr_pose, calib)
-            _, flow_res, conf_t = self.temporal_matcher(f_Lt, f_Lt1, kpts_t1_pred, kpts_Lt1, iter_idx=i+1)
+            delta_pose, delta_depth = self.DBA(r, w, J_p, J_d, lmbda)
+            curr_pose, curr_depth = self.DBA_Updater(curr_pose, curr_depth, delta_pose, delta_depth, a_p, a_d)
 
             poses_history.append(curr_pose)
-            weights_history.append(w)
-            errors_history.append(flow_res)
+            depths_history.append(curr_depth)
 
-        return (SE3(torch.stack([p.data for p in poses_history])), torch.stack(weights_history), torch.stack(errors_history))
+        return poses_history, depths_history, weights_history[-1] # 최종 결과와 시각화용 가중치 반환
     
 def project_kpts(kpts_t0, depth_t0, pose_t0t1, calib):
     """
