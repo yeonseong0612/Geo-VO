@@ -99,8 +99,8 @@ class VO(nn.Module):
         _, init_disp, _ = self.stereo_matcher(f_Lt, f_Rt, kpts_Lt, kpts_Rt)
         
         # d = (f * B) / disparity
-        curr_depth = (focal_batch * self.baseline) / (init_disp + 1e-6)
-        curr_depth = torch.clamp(curr_depth, min=0.1, max=100.0) # 안전장치
+        curr_depth = (focal_batch.view(B, 1, 1) * self.baseline) / (init_disp + 1e-6)
+        curr_depth = torch.clamp(curr_depth, min=1.0, max=80.0)        
         
         curr_pose = SE3.Identity(B, device=device)
         h = torch.zeros((B, kpts_Lt.shape[1], 256), device=device)
@@ -165,8 +165,7 @@ def project_kpts(kpts_t0, depth_t0, pose_t0t1, calib):
     # 2. SE3 포즈 변환 (t0 좌표계 -> t1 좌표계)
     # lietorch의 SE3 객체는 [B, N, 3] 형태의 포인트 클라우드 변환을 지원합니다.
     # pose_t0t1가 [B] 크기라면 노드 개수(N)만큼 확장해서 적용해야 할 수도 있습니다.
-    pts_3d_t1 = pose_t0t1.unsqueeze(1) * pts_3d_t0 # [B, N, 3]
-
+    pts_3d_t1 = pose_t0t1[:, None] * pts_3d_t0 # [B, N, 3]
     # 3. 3D 카메라 좌표계 -> 2D 픽셀 좌표계 (Projection)
     # u' = x' * fx / z' + cx
     # v' = y' * fy / z' + cy

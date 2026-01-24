@@ -65,6 +65,6 @@ def total_loss(outputs, gt_pose):
     
     l_weight = weight_reg_loss(weights_h, errors_h, gamma=0.8)
 
-    t_loss = l_pose + 0.05 * l_weight 
+    t_loss = l_pose + 0.01 * l_weight 
     
     return t_loss, t_err, r_err, l_weight.detach()

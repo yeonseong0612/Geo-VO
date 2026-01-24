@@ -24,7 +24,7 @@ vo_cfg.valsequencelist = ['00', '09', '10']
 vo_cfg.baseline = 0.54
 vo_cfg.num_cpu = 12            
 vo_cfg.batchsize = 4           
-vo_cfg.learning_rate = 1e-4
+vo_cfg.learning_rate = 1e-6
 vo_cfg.maxepoch = 60
 
 vo_cfg.iters = 8                

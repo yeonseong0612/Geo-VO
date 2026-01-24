@@ -295,40 +295,47 @@ class EpipolarCrossAttention(nn.Module):
     def __init__(self, feature_dim):
         super().__init__()
         self.dim = feature_dim
-        # self.heads = heads
         
         self.q_proj = nn.Linear(feature_dim, feature_dim)
         self.k_proj = nn.Linear(feature_dim, feature_dim)
         self.v_proj = nn.Linear(feature_dim, feature_dim)
-
         self.merge = nn.Linear(feature_dim, feature_dim)
 
     def forward(self, nodes_L, nodes_R, kpts_L, kpts_R):
         """
-        nodes_L: [N, C] (Left 이미지 노드 특징)
-        nodes_R: [M, C] (Right 이미지 노드 특징)
-        kpts_L: [N, 2] (u, v 좌표)
-        kpts_R: [M, 2] (u, v 좌표)
+        nodes_L: [B, N, C]
+        nodes_R: [B, M, C]
+        kpts_L: [B, N, 2]
+        kpts_R: [B, M, 2]
         """
+        B, N, C = nodes_L.shape
+        M = nodes_R.shape[1]
 
-        N = nodes_L.shape[0]
+        # 1. Linear Projection (배치 차원 유지)
+        Q = self.q_proj(nodes_L)  # [B, N, C]
+        K = self.k_proj(nodes_R)  # [B, M, C]
+        V = self.v_proj(nodes_R)  # [B, M, C]
 
-        Q = self.q_proj(nodes_L)  # [N, C]
-        K = self.k_proj(nodes_R)  # [M, C]
-        V = self.v_proj(nodes_R)  # [M, C]
-
-        # --- 에피폴라 제약 설정 ---
-        dist_v = torch.abs(kpts_L[:, 1:2] - kpts_R[:, 1].unsqueeze(0)) # Y축 차이
-        dist_u = kpts_L[:, 0:1] - kpts_R[:, 0].unsqueeze(0)            # X축 차이 (Disparity)
+        # 2. 에피폴라 제약 설정 (Batch 대응 인덱싱)
+        # kpts_L[:, :, 1:2] -> [B, N, 1]
+        # kpts_R[:, :, 1].unsqueeze(1) -> [B, 1, M]
+        dist_v = torch.abs(kpts_L[:, :, 1:2] - kpts_R[:, :, 1].unsqueeze(1)) # [B, N, M]
+        dist_u = kpts_L[:, :, 0:1] - kpts_R[:, :, 0].unsqueeze(1)            # [B, N, M]
+        
+        # y축 차이가 적고(수평선), x축 차이가 양수(우측 카메라가 더 좌측에 투영됨)인 구간 마스크
         mask = (dist_v < 3.0) & (dist_u > 0) & (dist_u < 192)
 
-        attn = torch.matmul(Q, K.transpose(0,1)) / (self.dim ** 0.5)   # [N, M]
+        # 3. Batch Matrix Multiplication & Masking
+        # K.transpose(1, 2)를 사용해 B를 제외한 N, M 차원만 연산
+        attn = torch.matmul(Q, K.transpose(1, 2)) / (self.dim ** 0.5)   # [B, N, M]
         attn = attn.masked_fill(~mask, -1e9)
-        attn_weights = F.softmax(attn, dim=-1)                          # [N, M]
-        matched_features = torch.matmul(attn_weights, V)                # [N, C]
-        # Soft-Argmax 스타일로 초기 Disparity(시차) 계산
-        # u_L - u_R 값들을 가중평균
-        init_disparity = torch.sum(attn_weights * dist_u, dim=-1, keepdim=True) # [N, 1]
+        attn_weights = F.softmax(attn, dim=-1) # [B, N, M]                      
+        
+        # 4. 특징 및 시차(Disparity) 집계
+        matched_features = torch.matmul(attn_weights, V) # [B, N, C]        
+        
+        # u_L - u_R 가중 평균
+        init_disparity = torch.sum(attn_weights * dist_u, dim=-1, keepdim=True) # [B, N, 1]
         confidence = mask.any(dim=-1, keepdim=True).float()
 
         return self.merge(matched_features), init_disparity, confidence
@@ -360,41 +367,53 @@ class TemporalCrossAttention(nn.Module):
         self.q_proj = nn.Linear(feature_dim, feature_dim)
         self.k_proj = nn.Linear(feature_dim, feature_dim)
         self.v_proj = nn.Linear(feature_dim, feature_dim)
-
         self.merge = nn.Linear(feature_dim, feature_dim)
 
     def forward(self, nodes_t, nodes_t1, kpts_t1_pred, kpts_t1_actual, iter_idx):
         """
-        nodes_t: [N, C] (L_t 노드 특징)
-        nodes_t1: [M, C] (L_t1 노드 특징 후보군)
-        kpts_t1_pred: [N, 2] (현재 포즈 가설로 투영된 예상 위치)
-        kpts_t1_actual: [M, 2] (L_t1에서 실제 추출된 특징점 좌표)
-        iter_idx: int (현재 루프 횟수, 0이면 루프 진입 전)
+        nodes_t: [B, N, C]
+        nodes_t1: [B, M, C]
+        kpts_t1_pred: [B, N, 2]
+        kpts_t1_actual: [B, M, 2]
+        iter_idx: int
         """
-        N = nodes_t.shape[0]
+        B, N, C = nodes_t.shape
+        M = nodes_t1.shape[1]
+
+        # 1. Iteration 기반 윈도우 사이즈 결정
         if iter_idx == 0:
             win_size = 64.0
         else:
             win_size = max(4.0, 32.0 / (2 ** (iter_idx - 1)))
         
-        Q = self.q_proj(nodes_t)   # [N, C]
-        K = self.k_proj(nodes_t1)  # [M, C]
-        V = self.v_proj(nodes_t1)  # [M, C]
+        # 2. Linear Projection (Batch 차원 유지)
+        Q = self.q_proj(nodes_t)   # [B, N, C]
+        K = self.k_proj(nodes_t1)  # [B, M, C]
+        V = self.v_proj(nodes_t1)  # [B, M, C]
 
-        dist_u = torch.abs(kpts_t1_pred[:, 0:1] - kpts_t1_actual[:, 0].unsqueeze(0))
-        dist_v = torch.abs(kpts_t1_pred[:, 1:2] - kpts_t1_actual[0, 1].unsqueeze(0))
+        # 3. 로컬 윈도우 마스크 생성 (Batch 대응)
+        # kpts_t1_pred[:, :, 0:1] -> [B, N, 1]
+        # kpts_t1_actual[:, :, 0].unsqueeze(1) -> [B, 1, M]
+        # 결과: [B, N, M]
+        dist_u = torch.abs(kpts_t1_pred[:, :, 0:1] - kpts_t1_actual[:, :, 0].unsqueeze(1))
+        dist_v = torch.abs(kpts_t1_pred[:, :, 1:2] - kpts_t1_actual[:, :, 1].unsqueeze(1))
 
         mask = (dist_u < win_size) & (dist_v < win_size)
 
-        attn = torch.matmul(Q, K.transpose(0, 1)) / (self.dim ** 0.5)
+        # 4. Batch Matrix Multiplication (BMM)
+        # Q: [B, N, C], K.transpose(1, 2): [B, C, M]
+        attn = torch.matmul(Q, K.transpose(1, 2)) / (self.dim ** 0.5) # [B, N, M]
         attn = attn.masked_fill(~mask, -1e9)
-        attn_weights = F.softmax(attn, dim=-1)      # [N, M]
+        attn_weights = F.softmax(attn, dim=-1)      # [B, N, M]
 
-        matched_features = torch.matmul(attn_weights, V)    #[N, C]
-        matched_kpts = torch.matmul(attn_weights, kpts_t1_actual) # [N, 2]
+        # 5. 특성 및 좌표 집계
+        # V: [B, M, C] -> matched_features: [B, N, C]
+        matched_features = torch.matmul(attn_weights, V)
+        # kpts_t1_actual: [B, M, 2] -> matched_kpts: [B, N, 2]
+        matched_kpts = torch.matmul(attn_weights, kpts_t1_actual)
 
+        # 6. Residual 및 Confidence 계산
         flow_residual = matched_kpts - kpts_t1_pred
-
-        confidence = mask.any(dim=-1, keepdim=True).float()
+        confidence = mask.any(dim=-1, keepdim=True).float() # [B, N, 1]
 
         return self.merge(matched_features), flow_residual, confidence
