@@ -22,13 +22,13 @@ class VO(nn.Module):
         self.DBA = DBASolver()
         self.DBA_Updater = PoseDepthUpdater()
         self.log_lmbda = nn.Parameter(torch.tensor(-4.6))
-        self.baseline = cfg.baseline
-        self.focal = cfg.focal
+        self.baseline = 0.54
 
     def forward(self, batch, iters=8, gt_guide=None):
         device = self.log_lmbda.device
         calib = batch['calib'].to(device)
         B = calib.shape[0]
+        focal_batch = calib[:, 0:1] # [B, 1]
 
         # --- feature and descriptor extraction ---
         if self.training:
@@ -99,7 +99,7 @@ class VO(nn.Module):
         _, init_disp, _ = self.stereo_matcher(f_Lt, f_Rt, kpts_Lt, kpts_Rt)
         
         # d = (f * B) / disparity
-        curr_depth = (self.focal * self.baseline) / (init_disp + 1e-6)
+        curr_depth = (focal_batch * self.baseline) / (init_disp + 1e-6)
         curr_depth = torch.clamp(curr_depth, min=0.1, max=100.0) # 안전장치
         
         curr_pose = SE3.Identity(B, device=device)
