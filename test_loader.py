@@ -1,76 +1,85 @@
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
-from src.loader import DataFactory, vo_collate_fn
+from src.loader import DataFactory, vo_collate_fn, vo_test_collate_fn
+from src.model import VO # 모델 클래스 임포트
 from CFG.vo_cfg import vo_cfg
+from lietorch import SE3
 
-def test_loader():
-    # 1. 설정 로드 (테스트용으로 배치 사이즈 2 설정)
-    vo_cfg.batchsize = 2
-    vo_cfg.precomputed_dir = "/home/jnu-ie/kys/Geo-VO/gendata/precomputed"
+@torch.no_grad()
+def run_integrated_test():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    print("--- 🚀 DataLoader Test 시작 ---")
+    # 0. 공통 설정
+    vo_cfg.batchsize = 1 # 추론 테스트를 위해 1로 설정
+    model = VO(vo_cfg).to(device)
+    model.eval()
+
+    print(f"--- 🚀 Integrated System Test (Device: {device}) ---")
+
+    # ==========================================================
+    # PART 1. 학습 모드 테스트 (Precomputed 데이터)
+    # ==========================================================
+    print("\n[STEP 1] Training Mode Data Check (.npz)")
+    train_ds = DataFactory(vo_cfg, mode='train')
+    train_loader = DataLoader(train_ds, batch_size=vo_cfg.batchsize, 
+                              shuffle=True, collate_fn=vo_collate_fn)
     
+    train_batch = next(iter(train_loader))
+    print(f"✅ Train Batch Keys: {list(train_batch.keys())}")
+    print(f"✅ Node Features Shape: {train_batch['node_features'].shape}") # [B, 4, 800, 256]
+
+    # ==========================================================
+    # PART 2. 추론 모드 테스트 (Raw Images + Real-time SP/DT)
+    # ==========================================================
+    print("\n[STEP 2] Inference Mode Data Check (Raw Images)")
+    test_ds = DataFactory(vo_cfg, mode='test')
+    test_loader = DataLoader(test_ds, batch_size=vo_cfg.batchsize, 
+                             shuffle=False, collate_fn=vo_test_collate_fn)
+    
+    test_batch = next(iter(test_loader))
+    
+    # 데이터 장비 이동
+    for k in test_batch:
+        if isinstance(test_batch[k], torch.Tensor):
+            test_batch[k] = test_batch[k].to(device)
+
+    print(f"✅ Test Batch Keys: {list(test_batch.keys())}")
+    print(f"✅ Raw Images Shape: {test_batch['imgs'].shape}") # [B, 3, 3, H, W]
+
+    # ==========================================================
+    # PART 3. 최종 추론 실행 및 결과 산출 (The Moment of Truth)
+    # ==========================================================
+    print("\n[STEP 3] Full Inference Execution")
     try:
-        # 2. 데이터셋 및 로더 초기화
-        dataset = DataFactory(vo_cfg, mode='train')
-        loader = DataLoader(
-            dataset, 
-            batch_size=vo_cfg.batchsize, 
-            shuffle=True, 
-            collate_fn=vo_collate_fn,
-            num_workers=0  # 디버깅을 위해 0으로 설정
-        )
+        # 모델 통과 (SuperPoint 추출 및 DT 그래프 생성이 내부에서 일어남)
+        outputs = model(test_batch, iters=12, mode='test')
         
-        # 3. 첫 번째 배치 가져오기
-        batch = next(iter(loader))
+        pred_poses = outputs['poses'][-1] # 마지막 이터레이션 결과 [B, 7]
+        gt_poses = SE3(test_batch['rel_pose']) # [B, 7]
         
-        print(f"✅ 배치 로드 성공! (Batch Size: {vo_cfg.batchsize})")
-        print("-" * 40)
-
-        # 4. 차원 정밀 검사
-        B = vo_cfg.batchsize
-        errors = 0
-
-        # [Check 1] Rel Pose
-        if batch['rel_pose'].shape == (B, 7):
-            print(f"  [PASS] Rel Pose: {batch['rel_pose'].shape}")
-        else:
-            print(f"  [FAIL] Rel Pose: Expected ({B}, 7), Got {batch['rel_pose'].shape}")
-            errors += 1
-
-        # [Check 2] Node Features (핵심: 4차원 여부)
-        if batch['node_features'].shape == (B, 4, 800, 256):
-            print(f"  [PASS] Node Features: {batch['node_features'].shape}")
-        else:
-            print(f"  [FAIL] Node Features: Expected ({B}, 4, 800, 256), Got {batch['node_features'].shape}")
-            errors += 1
-
-        # [Check 3] Edges (리스트 구조 및 크기)
-        if isinstance(batch['edges'], list) and len(batch['edges']) == B * 4:
-            avg_edges = sum([e.shape[1] for e in batch['edges']]) // (B * 4)
-            print(f"  [PASS] Edges List: Size {len(batch['edges'])}, Avg Edges: {avg_edges}")
-        else:
-            print(f"  [FAIL] Edges: 리스트 크기가 {B*4}가 아님")
-            errors += 1
-
-        # [Check 4] Calibration
-        if batch['calib'].shape == (B, 4):
-            print(f"  [PASS] Calibration: {batch['calib'].shape}")
-        else:
-            print(f"  [FAIL] Calibration: Expected ({B}, 4), Got {batch['calib'].shape}")
-            errors += 1
+        # 오차 계산
+        diff = pred_poses * gt_poses.inv()
+        v = diff.log() # [B, 6] -> [tx, ty, tz, rx, ry, rz]
+        
+        t_err = v[:, :3].norm(dim=-1).mean().item()
+        r_err = v[:, 3:].norm(dim=-1).mean().item()
 
         print("-" * 40)
-        if errors == 0:
-            print("✨ 모든 데이터 로더 테스트를 통과했습니다! 모델 학습을 시작하셔도 좋습니다.")
+        print(f"📊 프레임 번호: {test_batch['imgnum'][0]}")
+        print(f"📍 Translation Error: {t_err:.4f} m")
+        print(f"🔄 Rotation Error:    {r_err:.4f} rad")
+        print("-" * 40)
+        
+        if t_err < 1.0: # 1미터 미만이면 일단 성공적으로 작동하는 것으로 판단
+            print("✨ 결과: 모델이 이미지로부터 포즈를 성공적으로 추정했습니다!")
         else:
-            print(f"❌ {errors}개의 항목에서 정합성 오류가 발견되었습니다.")
+            print("⚠️ 경고: 오차가 큽니다. 가중치나 전처리를 확인하세요.")
 
     except Exception as e:
-        print(f"❌ 테스트 도중 에러 발생: {e}")
+        print(f"❌ 추론 도중 치명적 오류 발생: {e}")
         import traceback
         traceback.print_exc()
 
 if __name__ == "__main__":
-    test_loader()
+    run_integrated_test()

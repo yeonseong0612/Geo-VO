@@ -65,7 +65,7 @@ class VO(nn.Module):
         
         return torch.stack([u_next, v_next], dim=-1) # [B, N, 2]
     
-    def forward(self, batch, iters=8):
+    def forward(self, batch, iters=8, mode='train'):
         """
         batch 구성 (from vo_collate_fn):
         - node_features: [B, 4, 800, 256] (Lt, Rt, Lt1, Rt1)
@@ -74,22 +74,40 @@ class VO(nn.Module):
         - edge_attr: [B*4] 리스트 (각 원소는 [E_i, 3])
         - calib: [B, 4] (fx, fy, cx, cy)
         """
-        device = batch['node_features'].device
-        B = batch['node_features'].shape[0]         # batch size
-        N = 800                                     # keypoint number 
 
-        # kp & desc(Lt, Rt, Lt1, Rt1)
-        f_Lt, f_Rt, f_Lt1, f_Rt1 = [batch['node_features'][:, i] for i in range(4)] # [B, 800, 256]
-        k_Lt, k_Rt, k_Lt1, k_Rt1 = [batch['kpts'][:, i] for i in range(4)]           # [B, 800, 2]\
-        intrinsics = batch['calib'] # [B, 4]
+        if mode == 'train':
+            device = batch['node_features'].device
+            B = batch['node_features'].shape[0]         # batch size
+            N = 800                                     # keypoint number 
 
-        edges_Lt = []
-        edge_attr_Lt = []   
+            # kp & desc(Lt, Rt, Lt1, Rt1)
+            f_Lt, f_Rt, f_Lt1, f_Rt1 = [batch['node_features'][:, i] for i in range(4)] # [B, 800, 256]
+            k_Lt, k_Rt, k_Lt1, k_Rt1 = [batch['kpts'][:, i] for i in range(4)]           # [B, 800, 2]\
+            intrinsics = batch['calib'] # [B, 4]
 
-        for b in range(B):
-            idx = b * 4
-            edges_Lt.append(batch['edges'][idx].to(device))
-            edge_attr_Lt.append(batch['edge_attr'][idx].to(device))
+            edges_Lt = []
+            edge_attr_Lt = []   
+
+            for b in range(B):
+                idx = b * 4
+                edges_Lt.append(batch['edges'][idx].to(device))
+                edge_attr_Lt.append(batch['edge_attr'][idx].to(device))
+        else:
+            image = batch['imgs']
+            B = image.shape[0]
+            device = image.device
+            intrinsics = batch['calib']
+
+            k_Lt, f_Lt = self.extractor(image[:, 0])
+            k_Rt, f_Rt = self.extractor(image[:, 1])
+            k_Lt1, f_Lt1 = self.extractor(image[:, 2])
+
+            edges_Lt, edge_attr_Lt = [], []
+            kpts_np = k_Lt.detach().cpu().numpy()
+            for b in range(B):
+                e, ea = self.DT(kpts_np[b]) 
+                edges_Lt.append(torch.from_numpy(e).to(device))
+                edge_attr_Lt.append(torch.from_numpy(ea).to(device))
 
         v_stereo, init_disp, conf_stereo, _ = self.stereo_matcher(f_Lt, f_Rt, k_Lt, k_Rt)
 

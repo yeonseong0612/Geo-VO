@@ -6,6 +6,8 @@ import torch
 from lietorch import SE3
 from utils.calib import *
 from scipy.spatial.transform import Rotation as R
+from CFG.vo_cfg import vo_cfg as cfg
+
 def matrix_to_7vec(matrix):
     """[4, 4] 행렬을 [x, y, z, qx, qy, qz, qw] 7차원 벡터로 변환"""
     # matrix가 텐서라면 t도 텐서입니다.
@@ -76,30 +78,45 @@ class DataFactory(data.Dataset):
         rel_pose_7vec = rel_se3.data.squeeze()[:7]
         
         data = {
-            'rel_pose': rel_pose_7vec, # [7]
-            'calib': torch.from_numpy(self.calib[seq]),       # [4]
+            'rel_pose': rel_pose_7vec,                          # [7]
+            'calib': torch.from_numpy(self.calib[seq]),         # [4]
             'seq': seq,
             'imgnum': imgnum
         }
         
         # 2. 전처리된 데이터 로드 (Lt, Rt, Lt1, Rt1)
-        views = ['image_2', 'image_3', 'image_2', 'image_3']
-        indices = [imgnum, imgnum, imgnum + 1, imgnum + 1]
+        if self.mode == 'train':
+            views = ['image_2', 'image_3', 'image_2', 'image_3']
+            indices = [imgnum, imgnum, imgnum + 1, imgnum + 1]
 
-        precomputed = []
-        for v, i in zip(views, indices):
-            npz_path = os.path.join(self.cfg.precomputed_dir, seq, v, f"{str(i).zfill(6)}.npz")
-            npz = np.load(npz_path)
+            precomputed = []
+            for v, i in zip(views, indices):
+                npz_path = os.path.join(self.cfg.precomputed_dir, seq, v, f"{str(i).zfill(6)}.npz")
+                npz = np.load(npz_path)
+                
+                # 각 프레임 데이터를 개별적으로 리스트에 담음 (collate에서 합침)
+                precomputed.append({
+                    'node_features': torch.from_numpy(npz['node_features']).float(), # [800, 256]
+                    'edges': torch.from_numpy(npz['edges']).long(),                  # [2, E]
+                    'edge_attr': torch.from_numpy(npz['edge_attr']).float(),         # [E, 3]
+                    'kpts': torch.from_numpy(npz['kpts']).float()                    # [800, 2]
+                })
             
-            # 각 프레임 데이터를 개별적으로 리스트에 담음 (collate에서 합침)
-            precomputed.append({
-                'node_features': torch.from_numpy(npz['node_features']).float(), # [800, 256]
-                'edges': torch.from_numpy(npz['edges']).long(),                  # [2, E]
-                'edge_attr': torch.from_numpy(npz['edge_attr']).float(),         # [E, 3]
-                'kpts': torch.from_numpy(npz['kpts']).float()                    # [800, 2]
-            })
-        
-        data['precomputed'] = precomputed
+            data['precomputed'] = precomputed
+        else:
+            img_paths = [
+                os.path.join(self.cfg.odometry_home, 'sequences', seq, 'image_2', f"{str(imgnum).zfill(6)}.png"),
+                os.path.join(self.cfg.odometry_home, 'sequences', seq, 'image_3', f"{str(imgnum).zfill(6)}.png"),
+                os.path.join(self.cfg.odometry_home, 'sequences', seq, 'image_2', f"{str(imgnum+1).zfill(6)}.png")
+            ]
+
+            imgs = []
+            for path in img_paths:
+                img = cv2.imread(path)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+                imgs.append(img)
+            data['imgs'] = torch.stack(imgs) # [3, 3, H, W] (Lt, Rt, Lt1)
         return data
 
 def vo_collate_fn(batch):
@@ -137,6 +154,27 @@ def vo_collate_fn(batch):
         'kpts': torch.stack(batch_kpts),                   # [B, 4, 800, 2]
         'edges': all_edges,                                # [B*4] 크기의 리스트
         'edge_attr': all_edge_attrs,                       # [B*4] 크기의 리스트
+        'seq': [item['seq'] for item in batch],
+        'imgnum': [item['imgnum'] for item in batch]
+    }
+
+def vo_test_collate_fn(batch):
+    """실시간 추론 또는 Raw Image 테스트용 collate"""
+    # 1. 이미지 데이터 묶기 (Precomputed가 아닌 원시 이미지)
+    # 이미지 순서: [Lt, Rt, Lt1] (Rt1은 필요에 따라 추가)
+    # imgs shape: [B, 3, 3, H, W]
+    imgs = torch.stack([item['imgs'] for item in batch]) 
+    
+    # 2. 카메라 내당수 (항상 필요)
+    calibs = torch.stack([item['calib'] for item in batch])
+    
+    # 3. (옵션) 성능 측정을 위한 정답 포즈 - 실제 서비스 시엔 제외
+    rel_poses = torch.stack([item['rel_pose'] for item in batch]) if 'rel_pose' in batch[0] else None
+
+    return {
+        'imgs': imgs,
+        'calib': calibs,
+        'rel_pose': rel_poses,
         'seq': [item['seq'] for item in batch],
         'imgnum': [item['imgnum'] for item in batch]
     }
