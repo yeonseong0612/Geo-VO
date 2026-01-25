@@ -249,10 +249,14 @@ class GraphUpdateBlock(nn.Module):
         for i in range(B):
             e = edges[i] if isinstance(edges[i], torch.Tensor) else torch.tensor(edges[i], device=device)
             flat_edges_list.append(e + i * N)
-        
+        print(f"--- DEBUG ---")
+        print(f"List length: {len(flat_edges_list)}")
+        for idx, e in enumerate(flat_edges_list):
+            print(f"Tensor {idx} shape: {e.shape}, dim: {e.dim()}")
+        # -------------
         edges_combined = torch.cat(flat_edges_list, dim=1).to(device)
         edge_attr_combined = torch.cat(edge_attr, dim=0).to(device) if isinstance(edge_attr, list) else edge_attr
-
+      
         # --- 3. Spatial GAT 연산 ---
         x_spatial_flat, _ = self.spatial_gat(x_flat, edges_combined, edge_attr_combined)
         x_spatial = x_spatial_flat.view(B, N, -1)

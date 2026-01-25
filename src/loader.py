@@ -105,9 +105,10 @@ class DataFactory(data.Dataset):
             data['precomputed'] = precomputed
         else:
             img_paths = [
-                os.path.join(self.cfg.odometry_home, 'sequences', seq, 'image_2', f"{str(imgnum).zfill(6)}.png"),
-                os.path.join(self.cfg.odometry_home, 'sequences', seq, 'image_3', f"{str(imgnum).zfill(6)}.png"),
-                os.path.join(self.cfg.odometry_home, 'sequences', seq, 'image_2', f"{str(imgnum+1).zfill(6)}.png")
+                os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_2', f"{str(imgnum).zfill(6)}.png"),
+                os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_3', f"{str(imgnum).zfill(6)}.png"),
+                os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_2', f"{str(imgnum+1).zfill(6)}.png"),
+                os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_3', f"{str(imgnum+1).zfill(6)}.png")
             ]
 
             imgs = []
@@ -116,11 +117,10 @@ class DataFactory(data.Dataset):
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
                 imgs.append(img)
-            data['imgs'] = torch.stack(imgs) # [3, 3, H, W] (Lt, Rt, Lt1)
+            data['imgs'] = torch.stack(imgs)
         return data
 
 def vo_collate_fn(batch):
-    """개별 샘플을 배치 텐서로 병합"""
     # 1. 단순 텐서 스택
     rel_poses = torch.stack([item['rel_pose'] for item in batch]) # [B, 7]
     calibs = torch.stack([item['calib'] for item in batch])       # [B, 4]
