@@ -114,6 +114,7 @@ class VO(nn.Module):
         h = self.geo_bottleneck(v_feat, g_feat) 
         poses_list = []
         depths_list = []
+        weights_list = []   
 
         cur_h = h
         cur_pose = current_pose
@@ -141,5 +142,9 @@ class VO(nn.Module):
 
             poses_list.append(cur_pose)
             depths_list.append(cur_depth)
-
-        return poses_list, depths_list
+            weights_list.append(w)
+        return {
+            'poses': poses_list,
+            'depths': depths_list,
+            'weights': weights_list
+        }   

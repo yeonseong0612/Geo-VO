@@ -32,7 +32,7 @@ def pose_geodesic_loss(poses_h, gt_pose, gamma=0.8):
         weight = gamma ** (n_iters - i - 1)
 
         # 1m 오차와 약 0.5도 오차를 비슷한 중요도로 설정 (t:1, r:100)
-        total_loss += weight * (1.0 * t_err + 50.0 * r_err)
+        total_loss += weight * (1.0 * t_err + 100.0 * r_err)
         
         # 마지막 이터레이션의 에러를 기록 (모니터링용)
         if i == n_iters - 1:
@@ -40,40 +40,38 @@ def pose_geodesic_loss(poses_h, gt_pose, gamma=0.8):
             final_r_err = r_err.item()
 
     return total_loss, final_t_err, final_r_err
-
-def weight_reg_loss(weight_history, reproj_errors=None, gamma=0.8):
-    # 아직 reproj_errors 연동 전이라면 간단한 Regularization만 수행
+def weight_reg_loss(weight_history, gamma=0.8):
     n_iters = len(weight_history)
     loss = 0.0
     for i in range(n_iters):
         w = weight_history[i][..., 0:1] # Confidence channel
+        
+        # 1. 가중치 하한선 강제 (0으로 죽는 것 방지)
+        # 가중치가 0.01보다 작아지면 급격하게 로스를 부여합니다.
+        # 이를 통해 자코비안이 Singular Matrix가 되는 것을 물리적으로 막습니다.
+        floor_loss = torch.relu(0.1 - w).mean() 
+        
+        # 2. 기존의 1.0 정규화 (편식 억제)
         reg = torch.pow(w - 1.0, 2).mean()
         
         step_weight = gamma**(n_iters - i - 1)
-        loss += step_weight * reg
+        # 하한선 로스 비중을 높게 설정하여 시스템 안정성을 최우선으로 합니다.
+        loss += step_weight * (reg + 10.0 * floor_loss)
         
     return loss
 
 def total_loss(outputs, gt_pose_tensor):
-    """
-    [Inputs]
-    - outputs: VO 모델의 리턴 딕셔너리
-    - gt_pose_tensor: [B, 7] 형태의 상대 포즈 정답
-    """
     poses_h = outputs['poses']
     weights_h = outputs['weights']
     
-    # 1. SE3 객체로 변환
     gt_pose = SE3(gt_pose_tensor)
-    
-    # 2. 포즈 지오데식 로스 계산
     l_pose, t_err, r_err = pose_geodesic_loss(poses_h, gt_pose)
     
-    # 3. 가중치 정규화 로스 (가중치가 0으로 죽는 것 방지)
+    # 3. 가중치 로스 계산
     l_weight = weight_reg_loss(weights_h)
 
-    # 최종 로스 조합 (가중치 로스는 작게 시작)
-    t_loss = l_pose + 0.01 * l_weight 
+    # [핵심 변경] 가중치 로스 계수를 아주 작게(1e-5)라도 주어 
+    # 최소한의 수치적 안정성(Epsilon 역할)을 확보합니다.
+    t_loss = l_pose + 1e-5 * l_weight 
     
-    # train.py에서 4개의 인자를 받으므로 맞춰서 반환
-    return t_loss, t_err, r_err, l_weight.detach()  
+    return t_loss, t_err, r_err, l_weight.detach()
