@@ -32,7 +32,7 @@ def pose_geodesic_loss(poses_h, gt_pose, gamma=0.8):
         weight = gamma ** (n_iters - i - 1)
 
         # 1m 오차와 약 0.5도 오차를 비슷한 중요도로 설정 (t:1, r:100)
-        total_loss += weight * (1.0 * t_err + 100.0 * r_err)
+        total_loss += weight * (1.0 * t_err + 50.0 * r_err)
         
         # 마지막 이터레이션의 에러를 기록 (모니터링용)
         if i == n_iters - 1:
