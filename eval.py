@@ -175,7 +175,7 @@ def evaluate(model_path, cfg, seq_name):
 
 if __name__ == "__main__":
     # 방금 수정한 [T, Q] 순서로 학습된 최신 체크포인트 경로를 입력하세요!
-    MODEL_FILE = "checkpoint/GEO-VO/vo_model_59.pth"
+    MODEL_FILE = "checkpoint/GEO-VO/vo_model_40.pth"
     SEQUENCE = "09"
     
     if os.path.exists(MODEL_FILE):
