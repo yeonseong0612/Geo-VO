@@ -10,28 +10,31 @@ from CFG.vo_cfg import vo_cfg
 
 import cv2
 
-def save_matching_viz(img, weight, seq_name, frame_idx, save_dir):
-    """
-    weight: [1, H, W] 또는 [H, W] 형태의 텐서 (0~1 사이 값)
-    img: [3, H, W] 형태의 원본 이미지 텐서
-    """
-    # 텐서를 numpy 이미지로 변환
+def save_matching_viz(img, last_weight, seq_name, i, save_dir):
+    # 1. 원본 이미지 처리 (B, C, H, W) -> (H, W, C)
+    if img.dim() == 4:
+        img = img[0]
     img_np = img.permute(1, 2, 0).cpu().numpy()
-    img_np = (img_np * 255).astype(np.uint8)
+    
+    # [0, 1] range일 경우 255 스케일링 및 uint8 변환
+    if img_np.max() <= 1.0:
+        img_np = (img_np * 255).astype(np.uint8)
+    
     img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    H, W = img_np.shape[:2]
+
+    weight_np = last_weight[0, 0].cpu().numpy() 
     
-    # 가중치 맵 시각화 (0~1 -> 0~255)
-    weight_np = weight.squeeze().cpu().numpy()
-    weight_np = (weight_np * 255).astype(np.uint8)
-    
-    # Heatmap 적용 (믿을만한 지점은 빨간색, 무시하는 지점은 파란색)
-    heatmap = cv2.applyColorMap(weight_np, cv2.COLORMAP_JET)
-    
-    # 원본 이미지와 가중치 맵 합성
+    weight_norm = cv2.normalize(weight_np, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    heatmap = cv2.applyColorMap(weight_norm, cv2.COLORMAP_JET)
+
+    heatmap = cv2.resize(heatmap, (W, H), interpolation=cv2.INTER_LINEAR)
+
     combined = cv2.addWeighted(img_np, 0.6, heatmap, 0.4, 0)
     
-    out_path = os.path.join(save_dir, f"match_{frame_idx:04d}.png")
-    cv2.imwrite(out_path, combined)
+    # 5. 저장
+    file_path = f"{save_dir}/{seq_name}_{i:06d}.png"
+    cv2.imwrite(file_path, combined)
 
 
 def compute_ate_rpe(pred_poses, gt_poses):
@@ -130,7 +133,7 @@ def evaluate(model_path, cfg, seq_name):
                 if 'weights' in outputs:
                     # 마지막 반복(iteration)의 가중치 추출
                     last_weight = outputs['weights'][-1] # [1, H, W]
-                    current_img = batch['img1'][0] # [3, H, W]
+                    current_img = batch['imgs'][0] # [3, H, W]
                     
                     save_matching_viz(current_img, last_weight, seq_name, i, save_dir)
             # -----------------------
@@ -172,8 +175,8 @@ def evaluate(model_path, cfg, seq_name):
 
 if __name__ == "__main__":
     # 방금 수정한 [T, Q] 순서로 학습된 최신 체크포인트 경로를 입력하세요!
-    MODEL_FILE = "checkpoint/GEO-VO/vo_model_59.pth"
-    SEQUENCE = "10"
+    MODEL_FILE = "checkpoint/GEO-VO/vo_model_40.pth"
+    SEQUENCE = "09"
     
     if os.path.exists(MODEL_FILE):
         evaluate(MODEL_FILE, vo_cfg, SEQUENCE)
