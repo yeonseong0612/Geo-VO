@@ -8,6 +8,31 @@ from src.model import VO
 from src.loader import DataFactory
 from CFG.vo_cfg import vo_cfg
 
+import cv2
+
+def save_matching_viz(img, weight, seq_name, frame_idx, save_dir):
+    """
+    weight: [1, H, W] 또는 [H, W] 형태의 텐서 (0~1 사이 값)
+    img: [3, H, W] 형태의 원본 이미지 텐서
+    """
+    # 텐서를 numpy 이미지로 변환
+    img_np = img.permute(1, 2, 0).cpu().numpy()
+    img_np = (img_np * 255).astype(np.uint8)
+    img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    
+    # 가중치 맵 시각화 (0~1 -> 0~255)
+    weight_np = weight.squeeze().cpu().numpy()
+    weight_np = (weight_np * 255).astype(np.uint8)
+    
+    # Heatmap 적용 (믿을만한 지점은 빨간색, 무시하는 지점은 파란색)
+    heatmap = cv2.applyColorMap(weight_np, cv2.COLORMAP_JET)
+    
+    # 원본 이미지와 가중치 맵 합성
+    combined = cv2.addWeighted(img_np, 0.6, heatmap, 0.4, 0)
+    
+    out_path = os.path.join(save_dir, f"match_{frame_idx:04d}.png")
+    cv2.imwrite(out_path, combined)
+
 
 def compute_ate_rpe(pred_poses, gt_poses):
     ate_trans = []
@@ -89,16 +114,26 @@ def evaluate(model_path, cfg, seq_name):
     print(f"==> Starting Evaluation: Sequence {seq_name}")
     
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Inference"):
-            # 1. batch 내의 모든 텐서를 GPU로 한꺼번에 이동
+        for i, batch in enumerate(tqdm(loader, desc="Inference")):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
             # 2. 이미 batch가 GPU에 있으므로 .to(device) 없이 사용 가능
             rel_gt_se3 = SE3.InitFromVec(batch['rel_pose'])
             
             # 3. 모델 추론 (이제 모든 텐서가 GPU에 있어 안전함)
-            outputs = model(batch, iters=12, mode='test')
+            outputs = model(batch, iters=8, mode='test')
             rel_pred_se3 = outputs['poses'][-1]
+
+            # --- 시각화 로직 추가 ---
+            if i % 10 == 0:  # 10프레임마다 저장
+                # 모델이 가중치 맵을 'weights'라는 키로 반환한다고 가정 (GEO-VO/DROID-SLAM 구조)
+                if 'weights' in outputs:
+                    # 마지막 반복(iteration)의 가중치 추출
+                    last_weight = outputs['weights'][-1] # [1, H, W]
+                    current_img = batch['img1'][0] # [3, H, W]
+                    
+                    save_matching_viz(current_img, last_weight, seq_name, i, save_dir)
+            # -----------------------
 
 
             # World 좌표계 누적
