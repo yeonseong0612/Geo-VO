@@ -119,37 +119,43 @@ def export_parallel(model, dataloader, save_dir, num_cpu):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device) 
     
+    # [추가] 모델 내부에 selector가 정의되어 있어야 합니다. 
+    # 만약 VO 모델 클래스 내부에 없다면 여기서 별도로 선언합니다.
+    from src.layer import DescSelector
+    selector = DescSelector(in_dim=256, out_dim=128).to(device)
+    selector.eval()
+
     pool = mp.Pool(processes=num_cpu)
     async_results = []
 
     for batch in tqdm(dataloader, desc="Feature Extraction"):
-        images = batch['images'].to(device) 
+        images = batch['images'].to(device) # [B, 2, 3, 352, 1216]
         B = images.shape[0]
         seqs = batch['seq']
         imgnums = batch['imgnum'] 
-        h, w = images.shape[-2:]
+        img_shape = images.shape[-2:] # (352, 1216)
 
         for side_idx, side_name in zip([0, 1], ['image_2', 'image_3']):
-            kpts_all, desc_all = model.extractor(images[:, side_idx])
+            # 1. 원본 SuperPoint 추출 (800개)
+            kpts_raw, desc_raw = model.extractor(images[:, side_idx])
+            
+            # 2. [핵심] 설계한 DescSelector 적용 (800개 -> 정예 128개)
+            # final_feat: [B, 128, 128], final_kpts: [B, 128, 2]
+            final_feat, final_kpts, _ = selector(kpts_raw, desc_raw, img_shape, top_k=128)
             
             tasks = []
             for b in range(B):
-                k = kpts_all[b]     
-                d = desc_all[b]   
+                # 전처리 저장 시에는 128차원으로 압축된 피처와 선별된 좌표만 저장
+                k = final_kpts[b]     
+                d = final_feat[b]   
                 
-                
-                if d.shape[0] == 256 and d.shape[1] != 256:
-                    d = d.transpose(0, 1)
-                
-                node_feat = d
-
                 # 저장 경로 설정: [시퀀스]/[이미지_사이드]/[000000].npz
                 file_name = f"{int(imgnums[b]):06d}" 
                 rel_path = os.path.join(seqs[b], side_name, file_name)
 
                 tasks.append({
                     'kpts': k.cpu().numpy(),
-                    'node_features': node_feat.cpu().numpy(),
+                    'node_features': d.cpu().numpy(),
                     'rel_path': rel_path,
                     'save_dir': save_dir
                 })

@@ -85,90 +85,91 @@ class DataFactory(data.Dataset):
         }
         
         # 2. 전처리된 데이터 로드 (Lt, Rt, Lt1, Rt1)
-        if self.mode == 'train':
-            views = ['image_2', 'image_3', 'image_2', 'image_3']
-            indices = [imgnum, imgnum, imgnum + 1, imgnum + 1]
+        # if self.mode == 'train':
+            # views = ['image_2', 'image_3', 'image_2', 'image_3']
+            # indices = [imgnum, imgnum, imgnum + 1, imgnum + 1]
 
-            precomputed = []
-            for v, i in zip(views, indices):
-                npz_path = os.path.join(self.cfg.precomputed_dir, seq, v, f"{str(i).zfill(6)}.npz")
-                npz = np.load(npz_path)
+            # precomputed = []
+            # for v, i in zip(views, indices):
+            #     npz_path = os.path.join(self.cfg.precomputed_dir, seq, v, f"{str(i).zfill(6)}.npz")
+            #     npz = np.load(npz_path)
                 
-                # 각 프레임 데이터를 개별적으로 리스트에 담음 (collate에서 합침)
-                precomputed.append({
-                    'node_features': torch.from_numpy(npz['node_features']).float(), # [800, 256]
-                    'edges': torch.from_numpy(npz['edges']).long(),                  # [2, E]
-                    'edge_attr': torch.from_numpy(npz['edge_attr']).float(),         # [E, 3]
-                    'kpts': torch.from_numpy(npz['kpts']).float()                    # [800, 2]
-                })
+            #     # 각 프레임 데이터를 개별적으로 리스트에 담음 (collate에서 합침)
+            #     precomputed.append({
+            #         'node_features': torch.from_numpy(npz['node_features']).float(), # [800, 256]
+            #         'edges': torch.from_numpy(npz['edges']).long(),                  # [2, E]
+            #         'edge_attr': torch.from_numpy(npz['edge_attr']).float(),         # [E, 3]
+            #         'kpts': torch.from_numpy(npz['kpts']).float()                    # [800, 2]
+            #     })
             
-            data['precomputed'] = precomputed
-        else:
-            img_paths = [
-                os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_2', f"{str(imgnum).zfill(6)}.png"),
-                os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_3', f"{str(imgnum).zfill(6)}.png"),
-                os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_2', f"{str(imgnum+1).zfill(6)}.png"),
-                os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_3', f"{str(imgnum+1).zfill(6)}.png")
-            ]
+            # data['precomputed'] = precomputed
+        # else:
+        img_paths = [
+            os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_2', f"{str(imgnum).zfill(6)}.png"),
+            os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_3', f"{str(imgnum).zfill(6)}.png"),
+            os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_2', f"{str(imgnum+1).zfill(6)}.png"),
+            os.path.join(self.cfg.odometry_home, self.cfg.color_subdir, seq, 'image_3', f"{str(imgnum+1).zfill(6)}.png")
+        ]
 
-            imgs = []
-            for path in img_paths:
-                img = cv2.imread(path)
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-                imgs.append(img)
-            data['imgs'] = torch.stack(imgs)
+        imgs = []
+        for path in img_paths:
+            img = cv2.imread(path)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            H, W, _ = img.shape
+            img = img[H % 32:, :1216]
+            if img.shape[0] != 352 or img.shape[1] != 1216:
+                img = cv2.resize(img, (1216, 352), interpolation=cv2.INTER_LINEAR)
+                
+            img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            imgs.append(img)
+            
+        data['imgs'] = torch.stack(imgs) # [4, 3, 352, 1216]
         return data
 
+# def vo_collate_fn(batch):
+#     # 1. 단순 텐서 스택
+#     rel_poses = torch.stack([item['rel_pose'] for item in batch]) # [B, 7]
+#     calibs = torch.stack([item['calib'] for item in batch])       # [B, 4]
+
+#     # 2. 노드 및 좌표 데이터 (4차원 정렬: [B, 4, 800, C])
+#     # 모델의 forward에서 [:, 0] 등으로 접근 가능하게 함
+#     batch_node_features = []
+#     batch_kpts = []
+    
+#     # 3. 에지 데이터 (가변 크기이므로 평탄화된 리스트 유지: 크기 B*4)
+#     all_edges = []
+#     all_edge_attrs = []
+    
+#     for item in batch:
+#         # 각 샘플 내의 4개 뷰를 stack -> [4, 800, C]
+#         sample_node_feats = torch.stack([s['node_features'] for s in item['precomputed']])
+#         sample_kpts = torch.stack([s['kpts'] for s in item['precomputed']])
+        
+#         batch_node_features.append(sample_node_feats)
+#         batch_kpts.append(sample_kpts)
+        
+#         # 에지는 리스트에 순차적으로 추가 (순서: 샘플0_Lt, 샘플0_Rt, 샘플0_Lt1, 샘플0_Rt1, 샘플1_Lt...)
+#         for s in item['precomputed']:
+#             all_edges.append(s['edges'])
+#             all_edge_attrs.append(s['edge_attr'])
+
+#     return {
+#         'rel_pose': rel_poses,
+#         'calib': calibs,
+#         'node_features': torch.stack(batch_node_features), # [B, 4, 800, 256]
+#         'kpts': torch.stack(batch_kpts),                   # [B, 4, 800, 2]
+#         'edges': all_edges,                                # [B*4] 크기의 리스트
+#         'edge_attr': all_edge_attrs,                       # [B*4] 크기의 리스트
+#         'seq': [item['seq'] for item in batch],
+#         'imgnum': [item['imgnum'] for item in batch]
+#     }
+
 def vo_collate_fn(batch):
-    # 1. 단순 텐서 스택
-    rel_poses = torch.stack([item['rel_pose'] for item in batch]) # [B, 7]
-    calibs = torch.stack([item['calib'] for item in batch])       # [B, 4]
-
-    # 2. 노드 및 좌표 데이터 (4차원 정렬: [B, 4, 800, C])
-    # 모델의 forward에서 [:, 0] 등으로 접근 가능하게 함
-    batch_node_features = []
-    batch_kpts = []
-    
-    # 3. 에지 데이터 (가변 크기이므로 평탄화된 리스트 유지: 크기 B*4)
-    all_edges = []
-    all_edge_attrs = []
-    
-    for item in batch:
-        # 각 샘플 내의 4개 뷰를 stack -> [4, 800, C]
-        sample_node_feats = torch.stack([s['node_features'] for s in item['precomputed']])
-        sample_kpts = torch.stack([s['kpts'] for s in item['precomputed']])
-        
-        batch_node_features.append(sample_node_feats)
-        batch_kpts.append(sample_kpts)
-        
-        # 에지는 리스트에 순차적으로 추가 (순서: 샘플0_Lt, 샘플0_Rt, 샘플0_Lt1, 샘플0_Rt1, 샘플1_Lt...)
-        for s in item['precomputed']:
-            all_edges.append(s['edges'])
-            all_edge_attrs.append(s['edge_attr'])
-
-    return {
-        'rel_pose': rel_poses,
-        'calib': calibs,
-        'node_features': torch.stack(batch_node_features), # [B, 4, 800, 256]
-        'kpts': torch.stack(batch_kpts),                   # [B, 4, 800, 2]
-        'edges': all_edges,                                # [B*4] 크기의 리스트
-        'edge_attr': all_edge_attrs,                       # [B*4] 크기의 리스트
-        'seq': [item['seq'] for item in batch],
-        'imgnum': [item['imgnum'] for item in batch]
-    }
-
-def vo_test_collate_fn(batch):
-    """실시간 추론 또는 Raw Image 테스트용 collate"""
-    # 1. 이미지 데이터 묶기 (Precomputed가 아닌 원시 이미지)
-    # 이미지 순서: [Lt, Rt, Lt1] (Rt1은 필요에 따라 추가)
-    # imgs shape: [B, 3, 3, H, W]
     imgs = torch.stack([item['imgs'] for item in batch]) 
     
-    # 2. 카메라 내당수 (항상 필요)
     calibs = torch.stack([item['calib'] for item in batch])
     
-    # 3. (옵션) 성능 측정을 위한 정답 포즈 - 실제 서비스 시엔 제외
     rel_poses = torch.stack([item['rel_pose'] for item in batch]) if 'rel_pose' in batch[0] else None
 
     return {
