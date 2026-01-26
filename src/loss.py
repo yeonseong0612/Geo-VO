@@ -40,6 +40,7 @@ def pose_geodesic_loss(poses_h, gt_pose, gamma=0.8):
             final_r_err = r_err.item()
 
     return total_loss, final_t_err, final_r_err
+
 def weight_reg_loss(weight_history, gamma=0.8):
     n_iters = len(weight_history)
     loss = 0.0

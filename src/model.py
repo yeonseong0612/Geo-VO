@@ -5,6 +5,7 @@ from .extractor import SuperPointExtractor
 from utils.geo_utils import *
 from .layer import *
 from utils.DBA_utils import *
+from joblib import Parallel, delayed
 
 class VO(nn.Module):
     def __init__(self, cfg):
@@ -75,10 +76,19 @@ class VO(nn.Module):
         - calib: [B, 4] (fx, fy, cx, cy)
         """
 
+        # 1. 공통 변수 설정 (함수 시작하자마자 정의)
+        if 'calib' in batch:
+            B = batch['calib'].shape[0]
+        elif 'imgs' in batch:
+            B = batch['imgs'].shape[0]
+        else:
+            B = batch['node_features'].shape[0]
+            
+        device = batch['imgs'].device if mode == 'test' else batch['node_features'].device
+        intrinsics = batch['calib']
+
         if mode == 'train':
             device = batch['node_features'].device
-            B = batch['node_features'].shape[0]         # batch size
-            N = 800                                     # keypoint number 
 
             # kp & desc(Lt, Rt, Lt1, Rt1)
             f_Lt, f_Rt, f_Lt1, f_Rt1 = [batch['node_features'][:, i] for i in range(4)] # [B, 800, 256]
@@ -92,54 +102,34 @@ class VO(nn.Module):
                 idx = b * 4
                 edges_Lt.append(batch['edges'][idx].to(device))
                 edge_attr_Lt.append(batch['edge_attr'][idx].to(device))
-        else: # Inference Mode (Raw Images)
-            image = batch['imgs'] # [B, 4, 3, 376, 1241]
-            B = image.shape[0]
-            device = image.device
-            intrinsics = batch['calib']
+        else: # Inference Mode
+            image = batch['imgs'] # [B, 4, 3, H, W]
+            
+            # 1. 4개 뷰 한꺼번에 추출 (GPU 배치 효율 극대화)
+            V = 4
+            imgs_stacked = image.view(B * V, 3, image.shape[-2], image.shape[-1])
+            k_all, f_all = self.extractor(imgs_stacked) # [B*4, 800, 2], [B*4, 800, 256]
+            
+            # 다시 Lt, Rt, Lt1, Rt1로 분리
+            k_split = k_all.view(B, V, 800, 2)
+            f_split = f_all.view(B, V, 800, 256)
+            
+            k_Lt, k_Rt, k_Lt1, k_Rt1 = [k_split[:, i] for i in range(V)]
+            f_Lt, f_Rt, f_Lt1, f_Rt1 = [f_split[:, i] for i in range(V)]
 
-            # 1. 특징점 및 디스크립터 추출 (Lt, Rt, Lt1, Rt1)
-            # 학습 시 N=800이었으므로 추론 시에도 상위 800개를 유지하는 것이 안전합니다.
-            def extract_800(img):
-                k, f = self.extractor(img)
-                if k.shape[1] > 800:
-                    k, f = k[:, :800], f[:, :800]
-                elif k.shape[1] < 800:
-                    pad = 800 - k.shape[1]
-                    k = torch.cat([k, torch.zeros((B, pad, 2), device=device)], dim=1)
-                    f = torch.cat([f, torch.zeros((B, pad, 256), device=device)], dim=1)
-                return k, f
-
-            k_Lt, f_Lt   = extract_800(image[:, 0])
-            k_Rt, f_Rt   = extract_800(image[:, 1])
-            k_Lt1, f_Lt1 = extract_800(image[:, 2])
-            k_Rt1, f_Rt1 = extract_800(image[:, 3])
+            # 2. DT 계산 (CPU 병렬 처리)
+            all_k_np = [k_split[b, i].detach().cpu().numpy() for b in range(B) for i in range(V)]
+            # n_jobs=-1로 전체 코어 사용
+            results = Parallel(n_jobs=-1, backend="threading")(
+                delayed(process_single_view)(k, self.DT) for k in all_k_np
+            )
 
             edges_Lt, edge_attr_Lt = [], []
-            kpts_all = [k_Lt, k_Rt, k_Lt1, k_Rt1]
-            
-            # 2. 리스트 구조 동기화 (가장 중요!)
-            for b in range(B):
-                for i in range(4): # 반드시 4번 돌아서 edges와 edge_attr의 개수를 맞춥니다.
-                    k_np = kpts_all[i][b].detach().cpu().numpy()
-                    e_np = self.DT(k_np) # [2, E] (2xE 형태 반환 확인)
-                    
-                    if e_np.shape[1] > 0:
-                        # edge_attr 계산 ([dist, dx, dy])
-                        src_pts = k_np[e_np[0]]
-                        dst_pts = k_np[e_np[1]]
-                        diff = src_pts - dst_pts
-                        dist = np.linalg.norm(diff, axis=1, keepdims=True)
-                        attr_np = np.concatenate([dist, diff], axis=1).astype(np.float32)
-                        
-                        # [VITAL FIX] 인덱스와 속성을 동시에 append 하여 1:1 매칭 보장
-                        edges_Lt.append(torch.from_numpy(e_np).long().to(device))
-                        edge_attr_Lt.append(torch.from_numpy(attr_np).float().to(device))
-                    else:
-                        # 에지가 없는 경우 (더미 생성으로 리스트 인덱스 유지)
-                        edges_Lt.append(torch.zeros((2, 0), dtype=torch.long, device=device))
-                        edge_attr_Lt.append(torch.zeros((0, 3), dtype=torch.float, device=device))
-
+            for idx, (e_np, attr_np) in enumerate(results):
+                # 전방 Lt 이미지(인덱스 0, 4, 8...)에 대한 그래프만 모델 업데이트에 사용됨
+                if idx % 4 == 0:
+                    edges_Lt.append(torch.from_numpy(e_np).long().to(device))
+                    edge_attr_Lt.append(torch.from_numpy(attr_np).float().to(device))
                 
         v_stereo, init_disp, conf_stereo, _ = self.stereo_matcher(f_Lt, f_Rt, k_Lt, k_Rt)
 
@@ -181,6 +171,7 @@ class VO(nn.Module):
             
             lmbda = self.log_lmbda.exp()
             delta_pose, delta_depth = self.DBA(flow_res + r, w, J_p, J_d, lmbda)
+
 
             cur_pose, cur_depth = self.DBA_Updater(
                 cur_pose, cur_depth, delta_pose, delta_depth, a_p, a_d

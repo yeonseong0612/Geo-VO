@@ -142,7 +142,7 @@ class DBASolver(nn.Module):
         H_dd = H_dd + lmbda + node_lambda
 
         # 3. Schur Complement 및 inv_H_dd 계산
-        inv_H_dd = 1.0 / (H_dd + 1e-6)
+        inv_H_dd = 1.0 / (H_dd + 1e-2)
         H_pd_invHdd = H_pd * inv_H_dd.unsqueeze(-1) # [B, N, 6, 1]
 
         # H_eff = H_pp - sum(H_pd * inv_H_dd * J_pd^T)
@@ -167,8 +167,10 @@ class DBASolver(nn.Module):
         # v: [B, N, 1, 1] -> squeeze -> [B, N, 1]
         v = torch.matmul(H_pd.transpose(-1, -2), delta_pose.unsqueeze(1)).squeeze(-1)
         delta_depth = inv_H_dd * (g_d - v)
-
-        return delta_pose.squeeze(-1), delta_depth
+        delta_pose = delta_pose.squeeze(-1)
+        # 1프레임당 이동 2m, 회전 0.1rad(약 5도)로 제한
+        delta_pose = torch.clamp(delta_pose, min=-2.0, max=2.0) 
+        return delta_pose, delta_depth
     
 class PoseDepthUpdater(nn.Module):
     def __init__(self, min_depth=0.1, max_depth=100.0):
@@ -194,7 +196,7 @@ class PoseDepthUpdater(nn.Module):
         
         # T_new = Delta * T_curr (Local frame update)
         # 관례적으로 World-to-Camera 좌표계라면 이 순서가 맞습니다.
-        new_pose = delta_SE3 * curr_pose
+        new_pose = curr_pose * delta_SE3 
 
         return new_pose, new_depth
     
@@ -249,11 +251,7 @@ class GraphUpdateBlock(nn.Module):
         for i in range(B):
             e = edges[i] if isinstance(edges[i], torch.Tensor) else torch.tensor(edges[i], device=device)
             flat_edges_list.append(e + i * N)
-        print(f"--- DEBUG ---")
-        print(f"List length: {len(flat_edges_list)}")
-        for idx, e in enumerate(flat_edges_list):
-            print(f"Tensor {idx} shape: {e.shape}, dim: {e.dim()}")
-        # -------------
+
         edges_combined = torch.cat(flat_edges_list, dim=1).to(device)
         edge_attr_combined = torch.cat(edge_attr, dim=0).to(device) if isinstance(edge_attr, list) else edge_attr
       

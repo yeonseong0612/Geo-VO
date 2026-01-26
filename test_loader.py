@@ -1,55 +1,68 @@
-import os
-import cv2
 import torch
-import matplotlib.pyplot as plt
-from CFG.vo_cfg import vo_cfg as cfg
+import numpy as np
+import time
+from src.model import VO  # VO 클래스가 정의된 파일 경로
 
+class DummyConfig:
+    def __init__(self):
+        self.baseline = 0.54  # KITTI 기준
+        self.max_kpts = 800
 
-seq = '00'      # 테스트할 시퀀스
-imgnum = 0      # 테스트할 프레임 번호
+def run_vo_integration_test():
+    # 1. 환경 설정
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 테스트 장치: {device}")
 
-def test_single_load():
-    # 2. 경로 구성 확인
-    img_paths = [
-        os.path.join(cfg.odometry_home, cfg.color_subdir, seq, 'image_2', f"{str(imgnum).zfill(6)}.png"), # Lt
-        os.path.join(cfg.odometry_home, cfg.color_subdir, seq, 'image_3', f"{str(imgnum).zfill(6)}.png"), # Rt
-        os.path.join(cfg.odometry_home, cfg.color_subdir, seq, 'image_2', f"{str(imgnum+1).zfill(6)}.png"), # Lt1
-        os.path.join(cfg.odometry_home, cfg.color_subdir, seq, 'image_3', f"{str(imgnum+1).zfill(6)}.png")  # Rt1
-    ]
+    # 2. 모델 초기화
+    cfg = DummyConfig()
+    model = VO(cfg).to(device)
+    model.eval()
 
-    print(f"--- 🔍 경로 확인 ---")
-    for i, p in enumerate(img_paths):
-        exists = "✅ 존재함" if os.path.exists(p) else "❌ 파일 없음"
-        print(f"Path {i}: {p} ({exists})")
+    # 3. 가상 입력 데이터 생성 (Inference Mode 기준)
+    # [Batch, View, Channel, H, W] -> KITTI 해상도 (376, 1241)
+    B, V, C, H, W = 1, 4, 3, 376, 1241
+    dummy_imgs = torch.randn(B, V, C, H, W).to(device)
+    
+    # intrinsics: [fx, fy, cx, cy]
+    dummy_calib = torch.tensor([[718.8, 718.8, 607.1, 185.2]]).to(device)
 
-    # 3. 로드 로직 실행
-    imgs = []
-    for path in img_paths:
-        img = cv2.imread(path)
-        if img is None:
-            print(f"⚠️ 경고: {path} 로드 실패!")
-            continue
+    batch = {
+        'imgs': dummy_imgs,
+        'calib': dummy_calib
+    }
+
+    print(f"📦 입력 데이터 준비 완료: {dummy_imgs.shape}")
+    print("⚙️ 모델 추론 시작 (SP 추출 + Parallel DT + DBA Loop)...")
+
+    # 4. 추론 실행 및 시간 측정
+    start_time = time.time()
+    try:
+        with torch.no_grad():
+            # iters=12 정도로 설정하여 최적화 루프 테스트
+            outputs = model(batch, iters=12, mode='test')
         
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # (H, W, C) -> (C, H, W) 변환
-        img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        imgs.append(img_tensor)
+        end_time = time.time()
+        elapsed = end_time - start_time
 
-    if len(imgs) == 4:
-        # 4. 차원 병합 (Stack)
-        stacked_imgs = torch.stack(imgs)
+        # 5. 결과 검증
+        print("\n" + "="*30)
+        print("✅ 테스트 성공!")
+        print(f"⏱️ 소요 시간: {elapsed:.3f} 초")
+        print(f"📍 포즈 리스트 길이: {len(outputs['poses'])} (iters와 일치해야 함)")
         
-        print(f"\n--- 📊 차원(Dimension) 분석 ---")
-        print(f"낱개 이미지 텐서 모양: {imgs[0].shape}") # [3, H, W]
-        print(f"최종 데이터['imgs'] 모양: {stacked_imgs.shape}") # [4, 3, H, W]
-        print(f"차원 의미: [View_Count(4), Channels(3), Height, Width]")
+        # 마지막 이터레이션의 결과물 형태 확인
+        last_pose = outputs['poses'][-1]
+        last_depth = outputs['depths'][-1]
         
-        # 5. 시각적 확인 (첫 번째 이미지 출력)
-        plt.imshow(stacked_imgs[0].permute(1, 2, 0))
-        plt.title(f"Loaded Image: {seq} - {imgnum}")
-        plt.show()
-    else:
-        print("❌ 로드된 이미지가 4장이 아닙니다.")
+        print(f"🚗 최종 포즈 차원: {last_pose.data.shape}")  # [B, 7] (tx, ty, tz, qx, qy, qz, qw)
+        print(f"💎 최종 깊이 차원: {last_depth.shape}")     # [B, 800]
+        print("="*30)
+
+    except Exception as e:
+        print(f"\n❌ 테스트 중 오류 발생!")
+        print(f"에러 메시지: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    test_single_load()
+    run_vo_integration_test()

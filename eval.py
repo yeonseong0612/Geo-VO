@@ -90,13 +90,16 @@ def evaluate(model_path, cfg, seq_name):
     
     with torch.no_grad():
         for batch in tqdm(loader, desc="Inference"):
-            # 정답 상대 포즈 로드 (수정된 [T, Q] 순서 대응)
-            rel_gt_se3 = SE3.InitFromVec(batch['rel_pose'].to(device))
+            # 1. batch 내의 모든 텐서를 GPU로 한꺼번에 이동
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
-            # 모델 예측 (이터레이션 12회 수행)
-            outputs = model(batch, iters=12)
-            # outputs[0]은 poses_history, 마지막 인덱스 [-1]이 최종 결과
-            rel_pred_se3 = outputs[0][-1] 
+            # 2. 이미 batch가 GPU에 있으므로 .to(device) 없이 사용 가능
+            rel_gt_se3 = SE3.InitFromVec(batch['rel_pose'])
+            
+            # 3. 모델 추론 (이제 모든 텐서가 GPU에 있어 안전함)
+            outputs = model(batch, iters=12, mode='test')
+            rel_pred_se3 = outputs['poses'][-1]
+
 
             # World 좌표계 누적
             curr_gt = curr_gt * rel_gt_se3
@@ -134,8 +137,8 @@ def evaluate(model_path, cfg, seq_name):
 
 if __name__ == "__main__":
     # 방금 수정한 [T, Q] 순서로 학습된 최신 체크포인트 경로를 입력하세요!
-    MODEL_FILE = "checkpoint/GEO-VO/vo_model_16.pth"
-    SEQUENCE = "00"
+    MODEL_FILE = "checkpoint/GEO-VO/vo_model_59.pth"
+    SEQUENCE = "10"
     
     if os.path.exists(MODEL_FILE):
         evaluate(MODEL_FILE, vo_cfg, SEQUENCE)

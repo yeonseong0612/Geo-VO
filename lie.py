@@ -1,62 +1,33 @@
 import torch
 from lietorch import SE3
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 
-def verify_conversion():
-    print("--- 🔍 lietorch 정밀 구조 분석 (v2) ---")
+def verify_update_order():
+    # 1. 현재 포즈 (차 위치): x축으로 10m 가 있는 상태
+    # [tx, ty, tz, qx, qy, qz, qw]
+    curr_pose = SE3.InitFromVec(torch.tensor([10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
     
-    # 1. 입력 생성: [x, y, z, qx, qy, qz, qw]
-    # Z축 90도 회전 쿼터니언: [0, 0, 0.7071, 0.7071]
-    t_in = torch.tensor([10.0, 20.0, 30.0])
-    q_in = torch.tensor([0.0, 0.0, 0.7071, 0.7071])
-    vec7_input = torch.cat([t_in, q_in], dim=0).float()
-    
-    # 2. SE3 객체 생성
-    pose_obj = SE3.InitFromVec(vec7_input.unsqueeze(0))
-    
-    # 3. 내부 데이터(.data) 확인
-    # 여기서 shape이 [1, 7]인지 [1, 8]인지가 핵심입니다.
-    raw_data = pose_obj.data.squeeze(0)
-    print(f"가져온 SE3.data Shape: {raw_data.shape}")
-    print(f"가져온 SE3.data 값: {raw_data}")
+    # 2. 업데이트량 (delta): 제자리에서 왼쪽으로 90도 회전 (y축 기준)
+    # 쿼터니언 [0, 0.707, 0, 0.707] 은 y축 90도 회전
+    delta_vec = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.7071, 0.0, 0.7071])
+    delta_SE3 = SE3.InitFromVec(delta_vec)
 
-    # 4. 분해 테스트 (AttributeError 방지용 안전한 접근)
-    # lietorch SE3는 보통 .translation()과 .data[:, 3:7]로 나뉩니다.
-    t_out = pose_obj.translation().squeeze(0)
+    # CASE A: Left Multiplication (Delta * T) -> World Frame 기준
+    # "세상을 원점 기준으로 돌려버림"
+    left_update = delta_SE3 * curr_pose
     
-    # 쿼터니언 속성명 확인 (버전마다 다름: .quat, .quaternion, .data[:, 3:7])
-    try:
-        q_out = pose_obj.quat().squeeze(0)
-        method_name = "quat()"
-    except:
-        try:
-            q_out = pose_obj.unit_quaternion().squeeze(0)
-            method_name = "unit_quaternion()"
-        except:
-            # 메서드가 없으면 내부 데이터에서 직접 슬라이싱 (가장 확실)
-            q_out = raw_data[3:7] 
-            method_name = "data[3:7] slicing"
+    # CASE B: Right Multiplication (T * Delta) -> Local Frame 기준
+    # "차를 현재 위치에서 제자리 회전시킴"
+    right_update = curr_pose * delta_SE3
 
-    print("-" * 50)
-    print(f"추출 방법: {method_name}")
-    print(f"추출된 Translation: {t_out}")
-    print(f"추출된 Quaternion : {q_out}")
-
-    # 5. [중요] 다시 합치기 테스트
-    recombined = torch.cat([t_out, q_out], dim=0)
-    
-    # 6. 최종 정합성 체크
-    is_same = torch.allclose(vec7_input, recombined, atol=1e-4)
-    
-    print("-" * 50)
-    if is_same:
-        print("✅ 결론: 분해 후 합치기(cat)가 안전합니다!")
-        print("   순서가 [x, y, z, qx, qy, qz, qw]로 완벽히 유지됩니다.")
-    else:
-        print("❌ 결론: 순서가 뒤섞였습니다! 값을 비교해 보세요.")
-        print(f"원래 입력: {vec7_input}")
-        print(f"다시 합침: {recombined}")
+    print("=== [SE3 업데이트 순서 검증] ===")
+    print(f"초기 위치: {curr_pose.translation()[0].numpy()}")
+    print("-" * 30)
+    print(f"Left Multi (World) 후 위치:  {left_update.translation()[0].numpy()}")
+    print(" -> 해석: 원점(0,0,0)을 기준으로 10m 떨어진 차를 돌려버림 (x=10 이 z=10 으로 이동)")
+    print("-" * 30)
+    print(f"Right Multi (Local) 후 위치: {right_update.translation()[0].numpy()}")
+    print(" -> 해석: 현재 위치(10,0,0)는 유지하면서 차의 방향만 바뀜 (자전)")
 
 if __name__ == "__main__":
-    verify_conversion()
+    verify_update_order()
