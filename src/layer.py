@@ -4,6 +4,93 @@ import torch.nn.functional as F
 from lietorch import SE3
 from torch_geometric.nn import GATv2Conv
 
+import torch
+import torch.nn as nn
+
+class DescSelector(nn.Module):
+    def __init__(self, in_dim=256, out_dim=128):
+        super().__init__()
+        # 1. 박사 선배님의 아이디어: 디스크립터 압축 MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.LayerNorm(256), # 수치 안정성 확보
+            nn.SiLU(),
+            nn.Linear(256, out_dim)
+        )
+        self.score_head = nn.Linear(out_dim, 1)
+        self.out_dim = out_dim
+
+    def forward(self, kpts, desc, img_shape, top_k=128):
+        """
+        kpts: [B, N, 2], desc: [B, N, 256]
+        img_shape: (H, W)
+        """
+        B, N, _ = kpts.shape
+        H, W = img_shape
+        device = kpts.device
+
+        feat = self.mlp(desc) 
+        scores = self.score_head(feat).squeeze(-1)
+
+        x = kpts[..., 0]
+        y = kpts[..., 1]
+
+        mid_mask = (y > 0.2 * H) & (y <= 0.5 * H)
+        bottom_mask = (y > 0.5 * H)
+        
+        mid_grid_x = (x / W * 8).long().clamp(0, 7)
+        mid_grid_y = ((y - 0.2*H) / (0.3*H) * 4).long().clamp(0, 3)
+        mid_grid_id = mid_grid_y * 8 + mid_grid_x 
+        
+        btm_grid_x = (x / W * 16).long().clamp(0, 15)
+        btm_grid_y = ((y - 0.5*H) / (0.5*H) * 6).long().clamp(0, 5)
+        btm_grid_id = 32 + (btm_grid_y * 16 + btm_grid_x) 
+
+        grid_ids = torch.full((B, N), -1, dtype=torch.long, device=device)
+        grid_ids[mid_mask] = mid_grid_id[mid_mask]
+        grid_ids[bottom_mask] = btm_grid_id[bottom_mask]
+
+        final_indices = []
+        for b in range(B):
+            grid_max_scores = torch.full((128,), -1e9, device=device)
+            grid_max_idx = torch.full((128,), -1, dtype=torch.long, device=device)
+            
+            b_grid_ids = grid_ids[b]
+            b_scores = scores[b]
+            
+            valid_pts = b_grid_ids >= 0
+            if valid_pts.any():
+                for i in torch.where(valid_pts)[0]:
+                    g_id = b_grid_ids[i]
+                    if b_scores[i] > grid_max_scores[g_id]:
+                        grid_max_scores[g_id] = b_scores[i]
+                        grid_max_idx[g_id] = i
+            
+            selected_mask = grid_max_idx >= 0
+            selected_idx = grid_max_idx[selected_mask]
+            
+            num_selected = len(selected_idx)
+            if num_selected < top_k:
+                mask = torch.ones(N, dtype=torch.bool, device=device)
+                mask[selected_idx] = False
+                
+                remaining_scores = b_scores.clone()
+                remaining_scores[~mask] = -1e10 
+                
+                _, extra_idx = torch.topk(remaining_scores, top_k - num_selected)
+                batch_final_idx = torch.cat([selected_idx, extra_idx])
+            else:
+                batch_final_idx = selected_idx[:top_k]
+                
+            final_indices.append(batch_final_idx)
+
+        indices = torch.stack(final_indices) 
+        final_feat = torch.gather(feat, 1, indices.unsqueeze(-1).expand(-1, -1, self.out_dim))
+        final_kpts = torch.gather(kpts, 1, indices.unsqueeze(-1).expand(-1, -1, 2))
+        
+        return final_feat, final_kpts, indices
+        
+
 class GeometricGAT(nn.Module):
     def __init__(self, in_channels, hidden_channels=256, out_channels=256, heads=4):
         super().__init__()

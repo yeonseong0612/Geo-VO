@@ -12,6 +12,7 @@ class VO(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.extractor = SuperPointExtractor()
+        self.selector = DescSelector()
         self.DT = compute_delaunay_edges  # Delaunay Triangulation
 
         # 1. 시각 및 기하 매칭 모듈
@@ -87,50 +88,51 @@ class VO(nn.Module):
         device = batch['imgs'].device if mode == 'test' else batch['node_features'].device
         intrinsics = batch['calib']
 
-        if mode == 'train':
-            device = batch['node_features'].device
+        # if mode == 'train':
+        #     device = batch['node_features'].device
 
-            # kp & desc(Lt, Rt, Lt1, Rt1)
-            f_Lt, f_Rt, f_Lt1, f_Rt1 = [batch['node_features'][:, i] for i in range(4)] # [B, 800, 256]
-            k_Lt, k_Rt, k_Lt1, k_Rt1 = [batch['kpts'][:, i] for i in range(4)]           # [B, 800, 2]\
-            intrinsics = batch['calib'] # [B, 4]
+        #     # kp & desc(Lt, Rt, Lt1, Rt1)
+        #     f_Lt, f_Rt, f_Lt1, f_Rt1 = [batch['node_features'][:, i] for i in range(4)] # [B, 800, 256]
+        #     k_Lt, k_Rt, k_Lt1, k_Rt1 = [batch['kpts'][:, i] for i in range(4)]           # [B, 800, 2]\
+        #     intrinsics = batch['calib'] # [B, 4]
 
-            edges_Lt = []
-            edge_attr_Lt = []   
+        #     edges_Lt = []
+        #     edge_attr_Lt = []   
 
-            for b in range(B):
-                idx = b * 4
-                edges_Lt.append(batch['edges'][idx].to(device))
-                edge_attr_Lt.append(batch['edge_attr'][idx].to(device))
-        else: # Inference Mode
-            image = batch['imgs'] # [B, 4, 3, H, W]
+        #     for b in range(B):
+        #         idx = b * 4
+        #         edges_Lt.append(batch['edges'][idx].to(device))
+        #         edge_attr_Lt.append(batch['edge_attr'][idx].to(device))
+        # else: # Inference Mode
+        image = batch['imgs'] # [B, 4, 3, H, W]
+        
+        # 1. 4개 뷰 한꺼번에 추출 (GPU 배치 효율 극대화)
+        V = 4
+        imgs_stacked = image.view(B * V, 3, image.shape[-2], image.shape[-1])
+        k_all_raw, f_all_raw = self.extractor(imgs_stacked) # [B*4, 800, 2], [B*4, 800, 256] 
+        f_all, k_all, _ = self.selector(k_all_raw, f_all_raw, image.shape[-2:], top_k=128)
+
+        # 다시 Lt, Rt, Lt1, Rt1로 분리
+        k_split = k_all.view(B, V, 800, 2)
+        f_split = f_all.view(B, V, 800, 256)
+        
+        k_Lt, k_Rt, k_Lt1, k_Rt1 = [k_split[:, i] for i in range(V)]
+        f_Lt, f_Rt, f_Lt1, f_Rt1 = [f_split[:, i] for i in range(V)]
+
+        # 2. DT 계산 (CPU 병렬 처리)
+        all_k_np = [k_split[b, i].detach().cpu().numpy() for b in range(B) for i in range(V)]
+        # n_jobs=-1로 전체 코어 사용
+        results = Parallel(n_jobs=-1, backend="multiprocessing")(
+            delayed(process_single_view)(k, self.DT) for k in all_k_np
+        )
+
+        edges_Lt, edge_attr_Lt = [], []
+        for idx, (e_np, attr_np) in enumerate(results):
+            # 전방 Lt 이미지(인덱스 0, 4, 8...)에 대한 그래프만 모델 업데이트에 사용됨
+            if idx % 4 == 0:
+                edges_Lt.append(torch.from_numpy(e_np).long().to(device))
+                edge_attr_Lt.append(torch.from_numpy(attr_np).float().to(device))
             
-            # 1. 4개 뷰 한꺼번에 추출 (GPU 배치 효율 극대화)
-            V = 4
-            imgs_stacked = image.view(B * V, 3, image.shape[-2], image.shape[-1])
-            k_all, f_all = self.extractor(imgs_stacked) # [B*4, 800, 2], [B*4, 800, 256]
-            
-            # 다시 Lt, Rt, Lt1, Rt1로 분리
-            k_split = k_all.view(B, V, 800, 2)
-            f_split = f_all.view(B, V, 800, 256)
-            
-            k_Lt, k_Rt, k_Lt1, k_Rt1 = [k_split[:, i] for i in range(V)]
-            f_Lt, f_Rt, f_Lt1, f_Rt1 = [f_split[:, i] for i in range(V)]
-
-            # 2. DT 계산 (CPU 병렬 처리)
-            all_k_np = [k_split[b, i].detach().cpu().numpy() for b in range(B) for i in range(V)]
-            # n_jobs=-1로 전체 코어 사용
-            results = Parallel(n_jobs=-1, backend="threading")(
-                delayed(process_single_view)(k, self.DT) for k in all_k_np
-            )
-
-            edges_Lt, edge_attr_Lt = [], []
-            for idx, (e_np, attr_np) in enumerate(results):
-                # 전방 Lt 이미지(인덱스 0, 4, 8...)에 대한 그래프만 모델 업데이트에 사용됨
-                if idx % 4 == 0:
-                    edges_Lt.append(torch.from_numpy(e_np).long().to(device))
-                    edge_attr_Lt.append(torch.from_numpy(attr_np).float().to(device))
-                
         v_stereo, init_disp, conf_stereo, _ = self.stereo_matcher(f_Lt, f_Rt, k_Lt, k_Rt)
 
         v_stereo_feat, initial_depth = self.stereo_depth_mod(

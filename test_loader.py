@@ -1,68 +1,76 @@
 import torch
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
 import numpy as np
-import time
-from src.model import VO  # VO 클래스가 정의된 파일 경로
+import os
+# 사용자님이 작성하신 DataFactory와 collate_fn이 이 파일에 있다고 가정하거나 import 하세요.
+from src.loader import DataFactory, vo_collate_fn 
 
-class DummyConfig:
-    def __init__(self):
-        self.baseline = 0.54  # KITTI 기준
-        self.max_kpts = 800
-
-def run_vo_integration_test():
-    # 1. 환경 설정
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 테스트 장치: {device}")
-
-    # 2. 모델 초기화
-    cfg = DummyConfig()
-    model = VO(cfg).to(device)
-    model.eval()
-
-    # 3. 가상 입력 데이터 생성 (Inference Mode 기준)
-    # [Batch, View, Channel, H, W] -> KITTI 해상도 (376, 1241)
-    B, V, C, H, W = 1, 4, 3, 376, 1241
-    dummy_imgs = torch.randn(B, V, C, H, W).to(device)
+def test_data_pipeline():
+    print("🚀 KITTI Real-time Data Pipeline Test Start...")
     
-    # intrinsics: [fx, fy, cx, cy]
-    dummy_calib = torch.tensor([[718.8, 718.8, 607.1, 185.2]]).to(device)
+    # 1. 시뮬레이션을 위한 더미 설정 (실제 경로가 있으면 실제 cfg를 넣으셔도 됩니다)
+    class DummyCfg:
+        proj_home = "./"
+        odometry_home = "./data"
+        color_subdir = "sequences"
+        poses_subdir = "poses"
+        calib_subdir = "sequences"
+        trainsequencelist = ["00"]
+        traintxt = "train.txt"
+        batch_size = 4
+        num_cpu = 2
 
-    batch = {
-        'imgs': dummy_imgs,
-        'calib': dummy_calib
-    }
+    cfg = DummyCfg()
 
-    print(f"📦 입력 데이터 준비 완료: {dummy_imgs.shape}")
-    print("⚙️ 모델 추론 시작 (SP 추출 + Parallel DT + DBA Loop)...")
+    # 테스트용 gendata/train.txt 및 디렉토리 생성 (필요 시)
+    os.makedirs("gendata", exist_ok=True)
+    with open("gendata/train.txt", "w") as f:
+        f.write("00 0\n00 1\n00 2") # 시퀀스 00의 0, 1, 2번 인덱스
 
-    # 4. 추론 실행 및 시간 측정
-    start_time = time.time()
     try:
-        with torch.no_grad():
-            # iters=12 정도로 설정하여 최적화 루프 테스트
-            outputs = model(batch, iters=12, mode='test')
-        
-        end_time = time.time()
-        elapsed = end_time - start_time
+        # 2. 데이터셋 및 로더 초기화
+        # 실제 데이터가 없는 경우 에러가 날 수 있으므로, __getitem__ 내부를 
+        # 더미 리턴으로 살짝 수정해서 구조만 확인하는 것이 좋습니다.
+        dataset = DataFactory(cfg, mode='train')
+        loader = DataLoader(
+            dataset, 
+            batch_size=cfg.batch_size, 
+            shuffle=True, 
+            collate_fn=vo_collate_fn
+        )
 
-        # 5. 결과 검증
+        # 3. 데이터 한 배치 뽑기
+        batch = next(iter(loader))
+
+        # 4. 검증 루틴
         print("\n" + "="*30)
-        print("✅ 테스트 성공!")
-        print(f"⏱️ 소요 시간: {elapsed:.3f} 초")
-        print(f"📍 포즈 리스트 길이: {len(outputs['poses'])} (iters와 일치해야 함)")
+        print("✅ Batch Validation Results:")
+        print(f"1. Images Shape:   {batch['imgs'].shape}") 
+        # 기대 결과: [Batch, 4, 3, 352, 1216]
         
-        # 마지막 이터레이션의 결과물 형태 확인
-        last_pose = outputs['poses'][-1]
-        last_depth = outputs['depths'][-1]
+        print(f"2. Rel Pose Shape: {batch['rel_pose'].shape}")
+        # 기대 결과: [Batch, 7] (x, y, z, qx, qy, qz, qw)
         
-        print(f"🚗 최종 포즈 차원: {last_pose.data.shape}")  # [B, 7] (tx, ty, tz, qx, qy, qz, qw)
-        print(f"💎 최종 깊이 차원: {last_depth.shape}")     # [B, 800]
+        print(f"3. Calib Shape:    {batch['calib'].shape}")
+        # 기대 결과: [Batch, 4] (fx, fy, cx, cy)
+        
+        print(f"4. Sequences:      {batch['seq']}")
+        print(f"5. Image Numbers:  {batch['imgnum']}")
         print("="*30)
 
+        # 5. 시각적 확인 (첫 번째 샘플의 Lt 이미지)
+        img_to_show = batch['imgs'][0, 0].permute(1, 2, 0).cpu().numpy()
+        plt.figure(figsize=(12, 4))
+        plt.imshow(img_to_show)
+        plt.title(f"Sequence: {batch['seq'][0]} | Index: {batch['imgnum'][0]} (Lt)")
+        plt.axis('off')
+        plt.show()
+
     except Exception as e:
-        print(f"\n❌ 테스트 중 오류 발생!")
-        print(f"에러 메시지: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n❌ Test Failed: {e}")
+        print("\n💡 Tip: 실제 KITTI 데이터가 경로에 없으면 cv2.imread가 None을 반환합니다.")
+        print("구조만 확인하려면 DataFactory의 __getitem__에서 imgs를 torch.randn으로 리턴해보세요.")
 
 if __name__ == "__main__":
-    run_vo_integration_test()
+    test_data_pipeline()
