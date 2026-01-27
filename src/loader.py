@@ -61,11 +61,15 @@ class DataFactory(data.Dataset):
                 P2 = np.reshape(calibdata['P2'], (3, 4))
                 fx, fy, cx, cy = P2[0, 0], P2[1, 1], P2[0, 2], P2[1, 2]
 
-                H_raw = raw_img.shape[0] # 크롭 전 원본 높이
-                cy -= (H_raw % 32)
+                img_dir = os.path.join(cfg.odometry_home, cfg.color_subdir, seq, 'image_2')
+                first_img_name = sorted(os.listdir(img_dir))[0]
+                first_img_path = os.path.join(img_dir, first_img_name)
 
-                # 2. 가로(cx)는 유지 (:1216 크롭은 오른쪽을 쳐내는 것이라 원점 기준 cx는 불변)
-                data['calib'] = torch.tensor([fx, fy, cx, cy], dtype=torch.float32)
+                tmp_img = cv2.imread(first_img_path)
+                H_raw = tmp_img.shape[0]
+
+                cy -= (H_raw % 32)
+                self.calib[seq] = np.array([fx, fy, cx, cy], dtype=np.float32)
 
     def __len__(self):
         return len(self.datalist)
@@ -84,7 +88,7 @@ class DataFactory(data.Dataset):
         
         data = {
             'rel_pose': rel_pose_7vec,                          # [7]
-            'calib': torch.from_numpy(self.calib[seq]),         # [4]
+            'calib': torch.from_numpy(self.calib[seq]).float(),         # [4]
             'seq': seq,
             'imgnum': imgnum
         }

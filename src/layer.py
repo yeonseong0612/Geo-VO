@@ -10,15 +10,26 @@ import torch.nn as nn
 class DescSelector(nn.Module):
     def __init__(self, in_dim=256, out_dim=128):
         super().__init__()
-        # 1. 박사 선배님의 아이디어: 디스크립터 압축 MLP
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, 256),
-            nn.LayerNorm(256), # 수치 안정성 확보
+            nn.LayerNorm(256), 
             nn.SiLU(),
             nn.Linear(256, out_dim)
         )
         self.score_head = nn.Linear(out_dim, 1)
         self.out_dim = out_dim
+
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+        nn.init.constant_(self.score_head.weight, 0.001)
+        nn.init.constant_(self.score_head.bias, 0.0)
+        
 
     def forward(self, kpts, desc, img_shape, top_k=128):
         """
@@ -49,6 +60,7 @@ class DescSelector(nn.Module):
         grid_ids = torch.full((B, N), -1, dtype=torch.long, device=device)
         grid_ids[mid_mask] = mid_grid_id[mid_mask]
         grid_ids[bottom_mask] = btm_grid_id[bottom_mask]
+
 
         final_indices = []
         for b in range(B):
@@ -84,8 +96,9 @@ class DescSelector(nn.Module):
                 
             final_indices.append(batch_final_idx)
 
-        indices = torch.stack(final_indices) 
-        final_feat = torch.gather(feat, 1, indices.unsqueeze(-1).expand(-1, -1, self.out_dim))
+        indices = torch.stack(final_indices) # [B, 128]
+        
+        final_feat = torch.gather(desc, 1, indices.unsqueeze(-1).expand(-1, -1, 256))
         final_kpts = torch.gather(kpts, 1, indices.unsqueeze(-1).expand(-1, -1, 2))
         
         return final_feat, final_kpts, indices

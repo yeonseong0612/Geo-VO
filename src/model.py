@@ -107,14 +107,16 @@ class VO(nn.Module):
         image = batch['imgs'] # [B, 4, 3, H, W]
         
         # 1. 4개 뷰 한꺼번에 추출 (GPU 배치 효율 극대화)
-        V = 4
+        B, V = image.shape[0], 4
         imgs_stacked = image.view(B * V, 3, image.shape[-2], image.shape[-1])
         k_all_raw, f_all_raw = self.extractor(imgs_stacked) # [B*4, 800, 2], [B*4, 800, 256] 
         f_all, k_all, _ = self.selector(k_all_raw, f_all_raw, image.shape[-2:], top_k=128)
 
-        # 다시 Lt, Rt, Lt1, Rt1로 분리
-        k_split = k_all.view(B, V, 800, 2)
-        f_split = f_all.view(B, V, 800, 256)
+        N = k_all.shape[1] 
+        D = f_all.shape[-1]
+
+        k_split = k_all.view(B, V, N, 2)
+        f_split = f_all.view(B, V, N, D)
         
         k_Lt, k_Rt, k_Lt1, k_Rt1 = [k_split[:, i] for i in range(V)]
         f_Lt, f_Rt, f_Lt1, f_Rt1 = [f_split[:, i] for i in range(V)]
