@@ -127,16 +127,6 @@ def evaluate(model_path, cfg, seq_name):
             outputs = model(batch, iters=8, mode='test')
             rel_pred_se3 = outputs['poses'][-1]
 
-            # --- 시각화 로직 추가 ---
-            if i % 10 == 0:  # 10프레임마다 저장
-                # 모델이 가중치 맵을 'weights'라는 키로 반환한다고 가정 (GEO-VO/DROID-SLAM 구조)
-                if 'weights' in outputs:
-                    # 마지막 반복(iteration)의 가중치 추출
-                    last_weight = outputs['weights'][-1] # [1, H, W]
-                    current_img = batch['imgs'][0] # [3, H, W]
-                    
-                    save_matching_viz(current_img, last_weight, seq_name, i, save_dir)
-            # -----------------------
 
 
             # World 좌표계 누적
@@ -175,7 +165,7 @@ def evaluate(model_path, cfg, seq_name):
 
 if __name__ == "__main__":
     # 방금 수정한 [T, Q] 순서로 학습된 최신 체크포인트 경로를 입력하세요!
-    MODEL_FILE = "checkpoint/GEO-VO/vo_model_40.pth"
+    MODEL_FILE = "checkpoint/GEO-VO/vo_model_59.pth"
     SEQUENCE = "09"
     
     if os.path.exists(MODEL_FILE):
