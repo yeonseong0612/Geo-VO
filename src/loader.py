@@ -59,8 +59,13 @@ class DataFactory(data.Dataset):
             if os.path.exists(calib_path):
                 calibdata = read_calib_file(calib_path)
                 P2 = np.reshape(calibdata['P2'], (3, 4))
-                # [fx, fy, cx, cy]
-                self.calib[seq] = np.array([P2[0, 0], P2[1, 1], P2[0, 2], P2[1, 2]], dtype=np.float32)
+                fx, fy, cx, cy = P2[0, 0], P2[1, 1], P2[0, 2], P2[1, 2]
+
+                H_raw = raw_img.shape[0] # 크롭 전 원본 높이
+                cy -= (H_raw % 32)
+
+                # 2. 가로(cx)는 유지 (:1216 크롭은 오른쪽을 쳐내는 것이라 원점 기준 cx는 불변)
+                data['calib'] = torch.tensor([fx, fy, cx, cy], dtype=torch.float32)
 
     def __len__(self):
         return len(self.datalist)
