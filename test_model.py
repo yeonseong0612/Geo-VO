@@ -1,53 +1,89 @@
 import torch
+import torch.nn as nn
+from src.model import VO
+from lietorch import SE3
 
-def test_calib_slicing():
-    # 1. 실제 상황 설정 (DDP 배치가 1일 때, 전체 프레임은 4개)
-    B_actual = 1
-    num_views = 4
-    total_calib_rows = B_actual * num_views # 결과: 4
+@torch.no_grad()
+def create_dummy_batch(batch_size=2, num_kpts=800, num_tris=1200):
+    """테스트를 위한 가상 데이터 생성"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 더미 calib 생성 [4, 4] -> 각 행이 [fx, fy, cx, cy]
-    # 각 프레임마다 구분하기 쉽게 fx 값을 다르게 설정
-    # 0번: Lt, 1번: Rt, 2번: Lt1, 3번: Rt1
-    calib = torch.tensor([
-        [450.0, 450.0, 320.0, 240.0], # Lt0 (우리가 필요한 것)
-        [451.0, 451.0, 320.0, 240.0], # Rt0
-        [452.0, 452.0, 320.0, 240.0], # Lt1
-        [453.0, 453.0, 320.0, 240.0]  # Rt1
-    ])
+    batch = {
+        'kpts': torch.randn(batch_size, num_kpts, 2).to(device),
+        'pts_3d': torch.rand(batch_size, num_kpts, 3).to(device) * 20.0 + 2.0, # Depth 2~22m
+        'descs': torch.randn(batch_size, num_kpts, 256).to(device),
+        'kpts_tp1': torch.randn(batch_size, num_kpts, 2).to(device),
+        'calib': torch.tensor([[718.8, 718.8, 607.1, 185.2]] * batch_size).to(device),
+        'mask': torch.ones(batch_size, num_kpts).bool().to(device),
+        # 가변적인 삼각형 인덱스는 리스트로 처리
+        'tri_indices': [torch.randint(0, num_kpts, (num_tris, 3)).to(device) for _ in range(batch_size)],
+        'rel_pose': torch.randn(batch_size, 7).to(device) # GT Pose (Target)
+    }
+    return batch
 
-    print(f"==> Raw Calib Shape: {calib.shape}") # [4, 4]
+def test_vo_forward_backward():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"🚀 테스트 시작 (Device: {device})")
 
-    # 2. 기존 방식 (에러 발생 원인)
-    focal_wrong = calib[:, 0:1] 
-    print(f"\n[!] 기존 방식 focal shape: {focal_wrong.shape}") 
-    # 결과: [4, 1] -> 노드 배치 1과 맞지 않음 (Expected 1 but got 4)
-
-    # 3. 수정 방식 (Lt 프레임만 정확히 추출)
-    # 4개씩 묶인 데이터에서 첫 번째(Lt)만 가져오기
-    focal_correct = calib[::4, 0:1] 
-    print(f"==> 수정 방식 focal shape: {focal_correct.shape}")
-    print(f"    추출된 fx 값: {focal_correct.squeeze().item()} (Lt0의 fx와 일치해야 함)")
-
-    # 4. 브로드캐스팅 시뮬레이션 (StereoDepthModule 내부)
-    N = 100 # 노드 개수
-    init_disp = torch.randn(B_actual, N, 1) # [1, 100, 1]
+    # 1. 모델 초기화
+    # cfg 객체는 간단한 Namespace 등으로 대체 가능합니다.
+    class DummyCfg:
+        baseline = 0.54
+    cfg = DummyCfg()
     
-    print(f"\n==> Broadcasting Test:")
-    try:
-        # fB_expanded = [1, 1, 1]
-        fB_expanded = focal_correct.unsqueeze(1) 
-        inv_depth = init_disp / (fB_expanded + 1e-6)
-        print(f"    [Success] inv_depth shape: {inv_depth.shape}")
-    except Exception as e:
-        print(f"    [Failure] 연산 에러: {e}")
+    model = VO(cfg).to(device)
+    model.train() # 학습 모드
 
-    # 5. 여러 배치일 때 테스트 (B=2)
-    print("\n==> Multi-Batch Test (B=2):")
-    calib_B2 = torch.cat([calib, calib + 10], dim=0) # [8, 4]
-    focal_B2 = calib_B2[::4, 0:1] # [2, 1]
-    print(f"    calib_B2 shape: {calib_B2.shape}")
-    print(f"    focal_B2 shape: {focal_B2.shape} (기대값: [2, 1])")
+    # 2. 더미 데이터 생성
+    batch = create_dummy_batch()
+
+    # 3. Forward Pass
+    print("▶ Forward 진행 중...")
+    output = model(batch, iters=4) # 테스트용으로 4회 반복
+
+    # 4. 출력 값 검증
+    poses = output['poses']
+    final_pose = output['final_pose']
+    
+    assert len(poses) == 4, f"Iteration 결과 개수 불일치: {len(poses)}"
+    assert isinstance(final_pose, SE3), "최종 포즈가 SE3 객체가 아님"
+    print(f"✅ Forward 성공! 최종 포즈 차원: {final_pose.shape}")
+
+    # 5. Backward Pass 테스트 (Gradient Flow 체크)
+    print("▶ Backward 및 Gradient Flow 체크 중...")
+    # 간단한 Pose Loss (GT와의 차이)
+    gt_pose = SE3.InitFromVec(batch['rel_pose'])
+    
+    # Sequence Loss: 모든 iteration 결과에 대해 로스 계산
+    total_loss = 0
+    for i, p in enumerate(poses):
+        # Geodesic distance on SE3
+        diff = (gt_pose.inv() * p).log() # [B, 6]
+        total_loss += diff.abs().mean() * (0.8 ** (len(poses) - i - 1))
+
+    total_loss.backward()
+
+    # 6. 각 모듈의 가중치 업데이트 여부 확인
+    modules_to_check = {
+        "GAT": model.initializer.gat,
+        "TriangleHead": model.initializer.tri_head,
+        "UpdateBlock (GRU)": model.update_block.gru,
+        "Damping (Lambda)": model.log_lmbda
+    }
+
+    for name, module in modules_to_check.items():
+        if isinstance(module, nn.Parameter):
+            grad = module.grad
+        else:
+            # 첫 번째 파라미터의 기울기 확인
+            grad = next(module.parameters()).grad
+            
+        if grad is not None:
+            print(f"✅ {name}: Gradient 전파 확인 (Mean Grad: {grad.abs().mean().item():.6f})")
+        else:
+            print(f"❌ {name}: Gradient 전파 안 됨!")
+
+    print("\n✨ 모든 테스트가 성공적으로 완료되었습니다!")
 
 if __name__ == "__main__":
-    test_calib_slicing()
+    test_vo_forward_backward()

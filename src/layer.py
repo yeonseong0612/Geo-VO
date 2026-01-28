@@ -8,72 +8,69 @@ import torch
 import torch.nn as nn
 
 class GeometricGAT(nn.Module):
-    def __init__(self, desc_dim=256, pos_dim=3, hidden_channels=256, heads=4):
+    def __init__(self, in_channels, hidden_dim=256, heads=4, pos_dim=3):
         super().__init__()
-        # 1. Positional Encoding (u, v, Z 정보를 고차원으로 투영)
+        # 1. Positional Encoding
         self.pos_encoder = nn.Sequential(
             nn.Linear(pos_dim, 32),
             nn.SiLU(),
             nn.Linear(32, 64)
         )
 
-        # GAT 입력 차원: Descriptor(256) + Positional(64) = 320
-        in_channels = desc_dim + 64
+        self.actual_in_channels = in_channels
         
-        # Residual Projection (320 -> 256)
-        self.res_proj = nn.Linear(in_channels, hidden_channels)
+        self.res_proj = nn.Linear(self.actual_in_channels, hidden_dim)
 
-        # 2. GAT Layer (기하학적 엣지 속성 edge_dim=3 사용)
-        # edge_dim 3: [상대_u, 상대_v, 유클리드_거리]
         self.conv = GATv2Conv(
-            in_channels, 
-            hidden_channels // heads,
+            self.actual_in_channels, 
+            hidden_dim // heads,
             heads=heads, 
             edge_dim=3,
             add_self_loops=False
         )
         
-        self.norm = nn.LayerNorm(hidden_channels)
-        self.projector = nn.Linear(hidden_channels, 256) # 최종 R 추정용 피처
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.projector = nn.Linear(hidden_dim, 256) 
         self.SiLU = nn.SiLU()
 
-    def forward(self, x, kpts, pts_3d, edge_index):
+    def forward(self, x, edge_index, edge_attr=None, kpts=None, pts_3d=None):
         """
-        x: [N, 256] (Descriptors)
-        kpts: [N, 2] (u, v)
-        pts_3d: [N, 3] (X, Y, Z) - 여기서 Z(Depth)만 사용
+        x: [N, in_channels]
         edge_index: [2, E]
+        edge_attr: [E, 3] (Optional)
+        kpts, pts_3d: Initializer 모드일 때 좌표 정보를 합치기 위해 사용
         """
-        # [A] Node Feature 구성: Descs + MLP(u, v, Z)
-        # u, v 정규화 (이미지 사이즈 1216x352 기준)
-        norm_uv = kpts / torch.tensor([1216.0, 352.0], device=kpts.device)
-        depth = pts_3d[:, 2:3] # Depth Z만 추출
+        # [A] 만약 초기화 단계라면 (좌표 정보가 들어왔다면)
+        # 여기서 256(desc) + 64(pos)를 합쳐서 320차원을 만듭니다.
+        if kpts is not None and pts_3d is not None:
+            norm_uv = kpts / torch.tensor([1216.0, 352.0], device=kpts.device)
+            depth = pts_3d[:, 2:3]
+            pos_feat = self.pos_encoder(torch.cat([norm_uv, depth], dim=-1))
+            x = torch.cat([x, pos_feat], dim=-1) # [N, 320]
+            
+            # 엣지 속성이 없다면 생성
+            if edge_attr is None and edge_index is not None:
+                src, dst = edge_index[0], edge_index[1]
+                rel_uv = norm_uv[dst] - norm_uv[src]
+                dist = torch.norm(rel_uv, dim=-1, keepdim=True)
+                edge_attr = torch.cat([rel_uv, dist], dim=-1)
+
+        identity = self.res_proj(x)
         
-        pos_input = torch.cat([norm_uv, depth], dim=-1) # [N, 3]
-        pos_feat = self.pos_encoder(pos_input) # [N, 64]
+        if edge_index is None:
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=x.device)
+            edge_attr = torch.empty((0, 3), device=x.device)
+
+        out, (edge_index_out, alpha) = self.conv(x, edge_index, edge_attr, return_attention_weights=True)
         
-        node_x = torch.cat([x, pos_feat], dim=-1) # [N, 320]
-        
-        # [B] Edge Attribute 생성: 상대적 기하 관계 [Δu, Δv, dist]
-        src, dst = edge_index[0], edge_index[1]
-        rel_uv = norm_uv[dst] - norm_uv[src] # [E, 2]
-        dist = torch.norm(rel_uv, dim=-1, keepdim=True) # [E, 1]
-        edge_attr = torch.cat([rel_uv, dist], dim=-1) # [E, 3]
-        
-        # [C] GAT Forward + Residual
-        identity = self.res_proj(node_x)
-        
-        # GAT 통과 (1회)
-        out, (edge_index_out, alpha) = self.conv(node_x, edge_index, edge_attr, return_attention_weights=True)
-        
+        # [D] 나머지 로직 동일
         out = self.norm(out)
         out = self.SiLU(out)
-        out = out + identity # Residual Connection
-        
-        # 최종 프로젝션
+        out = out + identity
         out = self.projector(out)
         
         return out, alpha
+        
 
 class TriangleHead(nn.Module):
     def __init__(self, node_dim=256):
@@ -98,62 +95,80 @@ class TriangleHead(nn.Module):
         
         return w_j, n_j
     
-
 class GeoVOModel(nn.Module):
     def __init__(self, sigma_voting=2.0):
         super().__init__()
-        self.gat = GeometricGAT(desc_dim=256)
+        self.gat = GeometricGAT(in_channels=320)
         self.tri_head = TriangleHead(node_dim=256)
         self.sigma_voting = sigma_voting
 
-    def forward(self, x, kpts, pts_3d_t, pts_3d_tm1, edge_index, tri_indices, focal, cx):
-        """
-        x: [N, 256] 특징점 디스크립터
-        kpts: [N, 2] 2D 좌표
-        pts_3d_t: [N, 3] 현재 프레임 3D 점
-        pts_3d_tm1: [N, 3] 이전 프레임 3D 점
-        """
-        # 1. GAT & Triangle 피처 추출
-        # node_out: [N, 256]
-        node_out, _ = self.gat(x, kpts, pts_3d_t, edge_index)
+    def forward(self, node_feat, kpts, pts_3d, tri_indices, focal, cx):        
+        B, N, _ = node_feat.shape
+        device = node_feat.device
         
-        # 삼각형 정점 피처 결합 [T, 768]
-        f_tri = torch.cat([
-            node_out[tri_indices[:, 0]], 
-            node_out[tri_indices[:, 1]], 
-            node_out[tri_indices[:, 2]]
-        ], dim=-1)
+        all_weights = []
+        all_R_candidates = []
+        all_xv_j = []
+
+        for b in range(B):
+            tris = tri_indices[b]
+            if tris.shape[0] == 0: continue
+            
+            f_tri = torch.cat([
+                node_feat[b, tris[:, 0]], 
+                node_feat[b, tris[:, 1]], 
+                node_feat[b, tris[:, 2]]
+            ], dim=-1)
+            
+            weights, _ = self.tri_head(f_tri)
+            K_j = self.compute_individual_Kj(tris, pts_3d[b]) 
+            R_j = self.batch_svd(K_j)
+            
+            r13 = R_j[:, 0, 2]
+            r33 = R_j[:, 2, 2] + 1e-8
+            xv = focal[b] * (r13 / r33) + cx[b]
+            
+            all_weights.append(weights)
+            all_R_candidates.append(R_j)
+            all_xv_j.append(xv)
+
+        final_R_list = []
+        final_tri_weights = []
+        final_vp_conf = [] # 노드 레벨 신뢰도
         
-        # weights(w_j): [T, 1], pred_normals: [T, 3]
-        weights, pred_normals = self.tri_head(f_tri)
+        for b in range(B):
+            # 1. 미분 가능한 투표로 대표 소실점 결정
+            xv_star = differentiable_voting(all_xv_j[b], all_weights[b], sigma=self.sigma_voting)
+            
+            # 2. 삼각형별 소실점 일치도 (Soft-Inlier 가중치)
+            dist_sq = (all_xv_j[b] - xv_star)**2
+            s_j = torch.exp(-dist_sq / (2 * self.sigma_voting**2)).unsqueeze(-1)
+            
+            # 3. [핵심] vp_conf 생성: 삼각형 가중치를 노드로 뿌려줌
+            # 각 노드가 속한 삼각형들의 s_j 평균이나 최대값을 노드의 신뢰도로 사용
+            node_v_conf = torch.zeros((N, 1), device=device)
+            tris = tri_indices[b]
+            
+            # Scatter 연산을 사용하여 각 삼각형 정점들에 s_j 값을 누적
+            # (여러 삼각형에 속한 노드는 더 높은 확신을 가질 수 있음)
+            node_v_conf.scatter_add_(0, tris[:, 0:1], s_j)
+            node_v_conf.scatter_add_(0, tris[:, 1:2], s_j)
+            node_v_conf.scatter_add_(0, tris[:, 2:3], s_j)
+            
+            # 노드별 정규화 (선택 사항: 단순 sum 혹은 counts로 나눠 평균)
+            # 여기서는 0~1 사이로 유지하기 위해 tanh나 적절한 scaling 권장
+            node_v_conf = torch.tanh(node_v_conf) 
 
-        # 2. 모든 삼각형에 대한 개별 K_j 계산 [T, 3, 3]
-        K_j = self.compute_individual_Kj(tri_indices, pts_3d_t, pts_3d_tm1)
+            # 4. 최종 Weighted SVD
+            fw = all_weights[b] * s_j
+            R_final = estimate_rotation_svd_differentiable(fw, tris, pts_3d[b])
+            
+            final_R_list.append(R_final)
+            final_tri_weights.append(fw) # 삼각형 가중치 (List of [T, 1])
+            final_vp_conf.append(node_v_conf) # 노드 가중치 ([N, 1])
 
-        # 3. 삼각형별 로컬 R_j 후보군 추출 (Batch SVD)
-        # 각 삼각형이 주장하는 개별적인 회전 행렬들
-        R_j_candidates = self.batch_svd(K_j) # [T, 3, 3]
-        
-        # 4. 소실점 계산 및 Soft-Voting
-        # 식 (13): xv = f * (r13 / r33) + cx
-        r13 = R_j_candidates[:, 0, 2]
-        r33 = R_j_candidates[:, 2, 2] + 1e-8 # zero division 방지
-        xv_j = focal * (r13 / r33) + cx
-        
-        # 미분 가능한 방식으로 대표 소실점 xv_star 결정
-        xv_star = differentiable_voting(xv_j, weights, sigma=self.sigma_voting)
-
-        # 5. 소실점 일치도에 따른 Soft-Inlier 가중치(s_j) 계산
-        # 예측된 소실점 위치와 각 삼각형의 소실점 위치가 가까울수록 높은 가중치
-        dist_sq = (xv_j - xv_star)**2
-        s_j = torch.exp(-dist_sq / (2 * self.sigma_voting**2)).unsqueeze(-1)
-
-        # 6. 최종 Weighted SVD (최종 R 결정)
-        # GAT의 시각적 신뢰도(weights) * 기하적 일관성(s_j)
-        final_weights = weights * s_j
-        R_final = estimate_rotation_svd_differentiable(final_weights, tri_indices, pts_3d_t, pts_3d_tm1)
-
-        return R_final, pred_normals, final_weights
+        # 배치를 위해 stack
+        return torch.stack(final_R_list), final_tri_weights, torch.stack(final_vp_conf)
 
     def compute_individual_Kj(self, tri_indices, pts_t, pts_tm1):
         """각 삼각형별 3x3 상관 행렬 계산"""
@@ -329,14 +344,14 @@ class PoseDepthUpdater(nn.Module):
     
 
 class GraphUpdateBlock(nn.Module):
-    def __init__(self, node_dim=256, hidden_dim=256):
+    def __init__(self, input_dim=256, hidden_dim=256):
         super().__init__()
         self.hidden_dim = hidden_dim
 
         # 입력: node_feat(256) + residual(2) + tri_weight(1) + vp_conf(1) = 260차원
-        input_dim = node_dim + 2 + 1 + 1
+        input_dim = input_dim + 2 + 1 + 1
 
-        self.spatial_gat = GeometricGAT(in_channels=input_dim, out_channels=hidden_dim)
+        self.spatial_gat = GeometricGAT(in_channels=input_dim, hidden_dim=hidden_dim)
         self.norm_gat = nn.LayerNorm(hidden_dim)
         
         self.gru = nn.GRUCell(input_size=hidden_dim, hidden_size=hidden_dim)
