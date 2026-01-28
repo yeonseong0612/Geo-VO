@@ -1,6 +1,6 @@
 Evaluation Summary - Sequence 09
-Model Path: checkpoint/GEO-VO/vo_model_59.pth
+Model Path: checkpoint/GEO-VO/vo_model_43.pth
 ========================================
-ATE (Absolute Trajectory Error): 497.8177 m
-RPE-t (Relative Trans. Error):  1.0531 m
-RPE-r (Relative Rot. Error):    0.5960 deg
+ATE (Absolute Trajectory Error): 178.3903 m
+RPE-t (Relative Trans. Error):  1.0494 m
+RPE-r (Relative Rot. Error):    0.5670 deg

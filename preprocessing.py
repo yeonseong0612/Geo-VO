@@ -73,10 +73,11 @@ class PreprocessDataset(Dataset):
             'imgnum': s['imgnum']
         }
 
-# --- [2] CPU 병렬 저장 워커 (기존 유지) ---
+# --- [1] save_worker 수정: 800개를 그대로 저장 (DT 연산 제거) ---
 def save_worker(task_data):
     try:
-        from scipy.spatial import Delaunay
+        # 이제 전처리 단계에서 DT(Delaunay)를 하지 않습니다. 
+        # Selector가 점을 고른 뒤에 학습 시 실시간으로 수행해야 하기 때문입니다.
         kpts_np = task_data['kpts']
         node_features = task_data['node_features']
         rel_path = task_data['rel_path'] 
@@ -85,71 +86,40 @@ def save_worker(task_data):
         full_save_path = os.path.join(save_dir, rel_path + ".npz")
         os.makedirs(os.path.dirname(full_save_path), exist_ok=True)
 
-        if len(kpts_np) < 3:
-            edges_np = np.zeros((2, 0), dtype=np.int32)
-        else:
-            tri = Delaunay(kpts_np)
-            edges = np.concatenate([tri.simplices[:, [0, 1]], tri.simplices[:, [1, 2]], tri.simplices[:, [2, 0]]], axis=0)
-            edges = np.sort(edges, axis=1)
-            edges_np = np.unique(edges, axis=0).T
-
-        if edges_np.shape[1] > 0:
-            src_pts = kpts_np[edges_np[0]]
-            dst_pts = kpts_np[edges_np[1]]
-            diff = src_pts - dst_pts
-            dist = np.linalg.norm(diff, axis=1, keepdims=True)
-            edge_attr = np.concatenate([dist, diff], axis=1)
-        else:
-            edge_attr = np.empty((0, 3), dtype=np.float32)
-
+        # 800개의 좌표와 256차원 디스크립터만 압축 저장
         np.savez_compressed(
             full_save_path,
-            node_features=node_features.astype(np.float16),
-            edges=edges_np.astype(np.int32),
-            edge_attr=edge_attr.astype(np.float16),
+            node_features=node_features.astype(np.float16), # 용량 절약을 위한 fp16
             kpts=kpts_np.astype(np.float32)
         )
     except Exception as e:
         print(f"Error saving {rel_path}: {e}")
-
 
 @torch.no_grad()
 def export_parallel(model, dataloader, save_dir, num_cpu):
     model.eval()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device) 
-    
-    # [추가] 모델 내부에 selector가 정의되어 있어야 합니다. 
-    # 만약 VO 모델 클래스 내부에 없다면 여기서 별도로 선언합니다.
-    from src.layer import DescSelector
-    selector = DescSelector(in_dim=256, out_dim=128).to(device)
-    selector.eval()
 
     pool = mp.Pool(processes=num_cpu)
     async_results = []
 
-    for batch in tqdm(dataloader, desc="Feature Extraction"):
+    for batch in tqdm(dataloader, desc="SuperPoint Raw Extraction"):
         images = batch['images'].to(device) # [B, 2, 3, 352, 1216]
         B = images.shape[0]
         seqs = batch['seq']
         imgnums = batch['imgnum'] 
-        img_shape = images.shape[-2:] # (352, 1216)
 
         for side_idx, side_name in zip([0, 1], ['image_2', 'image_3']):
-            # 1. 원본 SuperPoint 추출 (800개)
+            # [수정] 800개 원본을 그대로 뽑습니다. (Selector를 거치지 않음!)
             kpts_raw, desc_raw = model.extractor(images[:, side_idx])
-            
-            # 2. [핵심] 설계한 DescSelector 적용 (800개 -> 정예 128개)
-            # final_feat: [B, 128, 128], final_kpts: [B, 128, 2]
-            final_feat, final_kpts, _ = selector(kpts_raw, desc_raw, img_shape, top_k=128)
             
             tasks = []
             for b in range(B):
-                # 전처리 저장 시에는 128차원으로 압축된 피처와 선별된 좌표만 저장
-                k = final_kpts[b]     
-                d = final_feat[b]   
+                # 원본 800개와 256차원 유지
+                k = kpts_raw[b]     
+                d = desc_raw[b]   
                 
-                # 저장 경로 설정: [시퀀스]/[이미지_사이드]/[000000].npz
                 file_name = f"{int(imgnums[b]):06d}" 
                 rel_path = os.path.join(seqs[b], side_name, file_name)
 
@@ -163,9 +133,10 @@ def export_parallel(model, dataloader, save_dir, num_cpu):
             res = pool.map_async(save_worker, tasks)
             async_results.append(res)
 
-        if len(async_results) > 50:
-            for r in async_results[:25]: r.wait()
-            async_results = async_results[25:]
+        # 세션 관리 (메모리 누수 방지)
+        if len(async_results) > 20:
+            for r in async_results[:10]: r.wait()
+            async_results = async_results[10:]
 
     pool.close()
     pool.join()

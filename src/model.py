@@ -68,49 +68,21 @@ class VO(nn.Module):
         return torch.stack([u_next, v_next], dim=-1) # [B, N, 2]
     
     def forward(self, batch, iters=8, mode='train'):
-        """
-        batch 구성 (from vo_collate_fn):
-        - node_features: [B, 4, 800, 256] (Lt, Rt, Lt1, Rt1)
-        - kpts: [B, 4, 800, 2]
-        - edges: [B*4] 리스트 (각 원소는 [2, E_i])
-        - edge_attr: [B*4] 리스트 (각 원소는 [E_i, 3])
-        - calib: [B, 4] (fx, fy, cx, cy)
-        """
-
-        # 1. 공통 변수 설정 (함수 시작하자마자 정의)
-        if 'calib' in batch:
-            B = batch['calib'].shape[0]
-        elif 'imgs' in batch:
-            B = batch['imgs'].shape[0]
-        else:
-            B = batch['node_features'].shape[0]
-            
-        device = batch['imgs'].device if mode == 'test' else batch['node_features'].device
+        B = batch['calib'].shape[0]
+        device = batch['calib'].device
         intrinsics = batch['calib']
+        V = 4 # View 개수 명시
 
-        # if mode == 'train':
-        #     device = batch['node_features'].device
+        # --- [Step 1: Raw Feature 획득] ---
+        if 'raw_node_features' in batch:
+            # [B, 4, 800, 256] -> [B*4, 800, 256]
+            f_all_raw = batch['raw_node_features'].view(B * V, 800, 256)
+            k_all_raw = batch['raw_kpts'].view(B * V, 800, 2)
+        else:
+            imgs_stacked = batch['imgs'].view(B * V, 3, 352, 1216)
+            k_all_raw, f_all_raw = self.extractor(imgs_stacked)
 
-        #     # kp & desc(Lt, Rt, Lt1, Rt1)
-        #     f_Lt, f_Rt, f_Lt1, f_Rt1 = [batch['node_features'][:, i] for i in range(4)] # [B, 800, 256]
-        #     k_Lt, k_Rt, k_Lt1, k_Rt1 = [batch['kpts'][:, i] for i in range(4)]           # [B, 800, 2]\
-        #     intrinsics = batch['calib'] # [B, 4]
-
-        #     edges_Lt = []
-        #     edge_attr_Lt = []   
-
-        #     for b in range(B):
-        #         idx = b * 4
-        #         edges_Lt.append(batch['edges'][idx].to(device))
-        #         edge_attr_Lt.append(batch['edge_attr'][idx].to(device))
-        # else: # Inference Mode
-        image = batch['imgs'] # [B, 4, 3, H, W]
-        
-        # 1. 4개 뷰 한꺼번에 추출 (GPU 배치 효율 극대화)
-        B, V = image.shape[0], 4
-        imgs_stacked = image.view(B * V, 3, image.shape[-2], image.shape[-1])
-        k_all_raw, f_all_raw = self.extractor(imgs_stacked) # [B*4, 800, 2], [B*4, 800, 256] 
-        f_all, k_all, _ = self.selector(k_all_raw, f_all_raw, image.shape[-2:], top_k=128)
+        f_all, k_all, _ = self.selector(k_all_raw, f_all_raw, (352, 1216), top_k=128)
 
         N = k_all.shape[1] 
         D = f_all.shape[-1]
@@ -121,17 +93,13 @@ class VO(nn.Module):
         k_Lt, k_Rt, k_Lt1, k_Rt1 = [k_split[:, i] for i in range(V)]
         f_Lt, f_Rt, f_Lt1, f_Rt1 = [f_split[:, i] for i in range(V)]
 
-        # 2. DT 계산 (CPU 병렬 처리)
-        all_k_np = [k_split[b, i].detach().cpu().numpy() for b in range(B) for i in range(V)]
-        # n_jobs=-1로 전체 코어 사용
-        results = Parallel(n_jobs=-1, backend="multiprocessing")(
+        all_k_np = [k_split[b, i].detach().cpu().numpy() for b in range(B) for i in range(V)]        
+        results = Parallel(n_jobs=6, backend="threading")(
             delayed(process_single_view)(k, self.DT) for k in all_k_np
         )
-
         edges_Lt, edge_attr_Lt = [], []
         for idx, (e_np, attr_np) in enumerate(results):
-            # 전방 Lt 이미지(인덱스 0, 4, 8...)에 대한 그래프만 모델 업데이트에 사용됨
-            if idx % 4 == 0:
+            if idx % 4 == 0: # 오직 Lt 이미지의 그래프만 추출
                 edges_Lt.append(torch.from_numpy(e_np).long().to(device))
                 edge_attr_Lt.append(torch.from_numpy(attr_np).float().to(device))
             

@@ -37,7 +37,7 @@ def train(rank, world_size, cfg):
         dataset, 
         batch_size=cfg.batchsize, 
         shuffle=(sampler is None),
-        num_workers=cfg.num_cpu,
+        num_workers=2,
         sampler=sampler, 
         collate_fn=vo_collate_fn,
         pin_memory=True
@@ -45,7 +45,7 @@ def train(rank, world_size, cfg):
 
     model = VO(cfg).to(device)
     if is_ddp:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
     raw_model = model.module if is_ddp else model
     
