@@ -96,7 +96,11 @@ class DataFactory(data.Dataset):
         # 2. 전처리된 Pair 데이터 로드 (Train 모드)
         if self.mode == 'train':
             pair_file = f"pair_{str(imgnum).zfill(6)}_{str(imgnum+1).zfill(6)}.npz"
-            pair_path = os.path.join(self.cfg.precomputed_dir, seq, 'image_2', pair_file)
+            pair_path = os.path.join(self.cfg.precomputed_dir, seq, pair_file)
+                        
+            if not os.path.exists(pair_path):
+                # 파일이 없을 경우 에러 메시지 출력 후 다음 단계 진행을 위해 예외 처리 권장
+                raise FileNotFoundError(f"❌ Pair 파일을 찾을 수 없습니다: {pair_path}")
             
             pair_data = np.load(pair_path)
             
