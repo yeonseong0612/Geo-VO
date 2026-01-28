@@ -159,15 +159,29 @@ def export_parallel(extractor, matcher, dataloader, save_dir, num_cpu):
     processor = GeoVOPreprocess(extractor, matcher)
     pool = mp.Pool(processes=num_cpu)
     
-    data_list = list(dataloader)
-    for i in tqdm(range(len(data_list) - 1), desc="Pair 전처리 중"):
-        batch_t = data_list[i]
-        batch_tp1 = data_list[i+1]
-        if batch_t['seq'][0] != batch_tp1['seq'][0]: continue
+    it = iter(dataloader)
+    
+    try:
+        batch_t = next(it)
+    except StopIteration:
+        return
+
+    for i in tqdm(range(len(dataloader) - 1), desc="Pair 전처리 중"):
+        try:
+            batch_tp1 = next(it)
+        except StopIteration:
+            break
+            
+        if batch_t['seq'][0] != batch_tp1['seq'][0]:
+            batch_t = batch_tp1
+            continue
             
         result = processor.process_pair(batch_t, batch_tp1)
+        
         rel_path = os.path.join(batch_t['seq'][0], f"pair_{int(batch_t['imgnum'][0]):06d}_{int(batch_tp1['imgnum'][0]):06d}")
         pool.apply_async(save_worker_pair, ({'result': result, 'rel_path': rel_path, 'save_dir': save_dir},))
+
+        batch_t = batch_tp1
 
     pool.close()
     pool.join()
@@ -182,6 +196,6 @@ if __name__ == "__main__":
 
     dataset = PreprocessDataset(RAW_DATA_PATH, SEQUENCES)
     if len(dataset) > 0:
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
         export_parallel(extractor, matcher, dataloader, SAVE_PATH, num_cpu=vo_cfg.num_cpu)
         print(f"✨ Geo-VO 통합 전처리 완료!")
