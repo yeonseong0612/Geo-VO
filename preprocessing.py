@@ -120,18 +120,23 @@ class GeoVOPreprocess:
         pts_3d = self.compute_3d(kpts_np, k_t_r[0].cpu().numpy(), stereo_matches, K)
         
         mask = np.linalg.norm(kpts_np, axis=1) > 0
+        valid_indices = np.where(mask)[0]
+        
         tri_indices = np.array([], dtype=np.int32)
-        if np.sum(mask) >= 3:
-            tri_indices = Delaunay(kpts_np[mask]).simplices
 
+        if len(valid_indices) >= 3:
+            dt = Delaunay(kpts_np[mask])
+            
+            tri_indices = valid_indices[dt.simplices].astype(np.int32)
         return {
             'kpts': kpts_np,
             'pts_3d': pts_3d,
             'descs': d_t_l[0].cpu().numpy(),
+            'kpts_tp1': k_tp1_l[0].cpu().numpy(), 
             'temporal_matches': temporal_matches['matches'][0].cpu().numpy(),
             'match_scores': temporal_matches['scores'][0].cpu().numpy(),
             'mask': mask,
-            'tri_indices': tri_indices,
+            'tri_indices': tri_indices, # 위 2번 항목(인덱스 매핑) 확인 필요!
             'K': K
         }
 
