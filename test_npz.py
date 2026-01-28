@@ -1,64 +1,56 @@
 import numpy as np
 import os
 
-def verify_geo_vo_precomputed(file_path):
+def verify_pair_data(file_path):
     if not os.path.exists(file_path):
         print(f"❌ 파일을 찾을 수 없습니다: {file_path}")
         return
 
-    # 1. 데이터 로드 (mmap_mode='r'로 효율적인 읽기)
-    data = np.load(file_path, allow_pickle=True)
+    # 데이터 로드
+    data = np.load(file_path)
     
-    print(f"\n{'='*20} 📂 파일 정보: {os.path.basename(file_path)} {'='*20}")
+    print(f"\n{'='*20} 📂 Pair 파일 정보: {os.path.basename(file_path)} {'='*20}")
     
-    # 2. 저장된 모든 키(Keys) 확인
-    for key in data.files:
-        val = data[key]
-        print(f"✅ {key:<12} : Shape {str(val.shape):<15} | dtype: {val.dtype}")
+    # 1. 저장된 항목별 Shape 및 타입 확인
+    keys = ['kpts', 'pts_3d', 'descs', 'temporal_matches', 'match_scores', 'mask', 'tri_indices', 'K']
+    for k in keys:
+        if k in data:
+            print(f"✅ {k:<18} : Shape {str(data[k].shape):<15} | dtype: {data[k].dtype}")
+        else:
+            print(f"⚠️ {k:<18} : 데이터가 존재하지 않습니다!")
 
-    # 3. 데이터 무결성 및 기하 정보 상세 검사
-    print(f"\n{'*'*20} 🔍 데이터 무결성 체크 {'*'*20}")
+    # 2. 기하학적 무결성 체크
+    print(f"\n{'*'*20} 🔍 데이터 정밀 체크 {'*'*20}")
     
-    # [A] 마스크 및 특징점 유효성
-    mask = data['mask']
-    kpts = data['kpts']
-    num_valid = np.sum(mask)
-    print(f"⭐ 유효 특징점 수    : {num_valid} / {len(mask)} (Masked)")
+    # [A] 3D 점(pts_3d) 유효성 확인 [Image of 3D point cloud projection in stereo vision]
+    pts_3d = data['pts_3d']
+    z_values = pts_3d[:, 2] # Depth
+    valid_z = z_values[z_values > 0]
+    print(f"⭐ 유효 Depth(Z>0) 수 : {len(valid_z)} / {len(z_values)}")
+    if len(valid_z) > 0:
+        print(f"⭐ 평균 Depth 거리    : {np.mean(valid_z):.2f}m (Min: {np.min(valid_z):.1f}m, Max: {np.max(valid_z):.1f}m)")
 
-    # [B] 카메라 내적 행렬 (K) 및 주점 보정 확인
-    K = data['K']
-    img_sz = data['image_size'] # [H, W] -> [352, 1216]
-    cx, cy = K[0, 2], K[1, 2]
-    print(f"⭐ 보정된 주점(cx, cy): ({cx:.2f}, {cy:.2f})")
-    print(f"⭐ 이미지 규격(H, W)  : {img_sz[0]} x {img_sz[1]}")
-    
-    # cy가 리사이즈/크롭 후 이미지 중심 근처에 있는지 체크 (보통 352/2 = 176 근처)
-    if 150 < cy < 200:
-        print(f"⭐ 주점 보정 상태     : PASS (cy가 {cy:.1f}로 정상 범위 내에 있음)")
-    else:
-        print(f"⭐ 주점 보정 상태     : WARNING (cy 위치 확인 필요)")
+    # [B] 시간적 매칭(Temporal Matches) 확인 [Image of feature matching between consecutive video frames]
+    matches = data['temporal_matches']
+    scores = data['match_scores']
+    print(f"⭐ 시간적 매칭 쌍 수  : {len(matches)}개")
+    if len(scores) > 0:
+        print(f"⭐ 매칭 신뢰도 평균   : {np.mean(scores):.4f}")
 
-    # [C] 삼각형(DT) 정보 검사
+    # [C] 삼각형 인덱스 유효성
     tri_idx = data['tri_indices']
-    if tri_idx.size > 0:
-        print(f"⭐ 생성된 삼각형 수   : {len(tri_idx)}개")
-        # 인덱스 유효성: 모든 삼각형 정점이 유효 특징점 범위 내에 있는지
-        is_tri_valid = np.max(tri_idx) < num_valid
-        print(f"⭐ 삼각형 인덱스 유효 : {'PASS' if is_tri_valid else 'FAIL'}")
-    else:
-        print("⚠️ 생성된 삼각형이 없습니다. (특징점 부족 가능성)")
+    kpts_len = len(data['kpts'])
+    if len(tri_idx) > 0:
+        is_tri_safe = np.max(tri_idx) < kpts_len
+        print(f"⭐ 삼각형 인덱스 안전 : {'PASS' if is_tri_safe else 'FAIL (Out of Bounds)'}")
 
-    # [D] 디스크립터 정밀도 확인
-    descs = data['descs']
-    if descs.dtype == np.float16:
-        print(f"⭐ 데이터 압축 상태   : PASS (fp16 적용됨)")
-    else:
-        print(f"⭐ 데이터 압축 상태   : NOTE (fp32 사용 중)")
+    # [D] 주점 보정 값 (cy) 재확인
+    K = data['K']
+    print(f"⭐ 적용된 주점(cy)    : {K[1, 2]:.2f} (보정 여부 확인용)")
 
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
-    # 전처리 결과가 저장된 실제 경로로 수정하세요.
-    SAMPLE_PATH = "/home/jnu-ie/kys/Geo-VO/gendata/precomputed/00/image_2/000120.npz"
-    
-    verify_geo_vo_precomputed(SAMPLE_PATH)
+    # 실제로 생성된 pair npz 파일 경로로 수정하세요
+    SAMPLE_PAIR_PATH = "/home/jnu-ie/kys/Geo-VO/gendata/precomputed/00/pair_000000_000001.npz"
+    verify_pair_data(SAMPLE_PAIR_PATH)
