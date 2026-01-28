@@ -174,5 +174,45 @@ def export_parallel(model, dataloader, save_dir, num_cpu):
     pool.join()
 
 if __name__ == "__main__":
-    # 경로 설정 및 실행 로직 동일
-    pass
+    # 1. 경로 설정 (사용자 환경에 맞춰 확인 필요)
+    RAW_DATA_PATH = "/home/jnu-ie/Dataset/kitti_odometry/data_odometry_color/dataset/sequences" 
+    SAVE_PATH = "/home/jnu-ie/kys/Geo-VO/gendata/precomputed"
+    
+    # 처리할 시퀀스 리스트 (00~08)
+    SEQUENCES = [f"{i:02d}" for i in range(9)] 
+    
+    # 2. 모델 및 설정 초기화
+    # 전처리 시에는 precomputed 데이터를 쓰지 않으므로 False 설정
+    vo_cfg.use_precomputed = False 
+    
+    print("Geo-VO 모델 로드 중...")
+    model = VO(vo_cfg)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    
+    # 3. 데이터셋 및 데이터로더 생성
+    dataset = PreprocessDataset(RAW_DATA_PATH, SEQUENCES)
+    print(f"🔎 총 샘플 수: {len(dataset)}")
+    
+    if len(dataset) == 0:
+        print("데이터를 찾지 못했습니다. RAW_DATA_PATH를 확인해주세요.")
+    else:
+        # num_workers는 데이터 로드 병렬화, num_cpu는 저장(save_worker) 병렬화에 사용됩니다.
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=vo_cfg.batchsize, 
+            num_workers=4, 
+            shuffle=False,
+            drop_last=False
+        )
+        
+        print(f"전처리를 시작합니다. (저장 경로: {SAVE_PATH})")
+        export_parallel(
+            model=model, 
+            dataloader=dataloader, 
+            save_dir=SAVE_PATH, 
+            num_cpu=vo_cfg.num_cpu
+        )
+        
+        print(f"\n모든 시퀀스 전처리 완료!")
+        print(f"결과물 확인: {os.listdir(SAVE_PATH)}")

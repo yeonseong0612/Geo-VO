@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from thirdparty.superpoint.superpoint import SuperPoint
 class SuperPointExtractor:
-    def __init__(self, weights="/home/yskim/projects/Geo-VO/superpoint_v6_from_tf.pth",
+    def __init__(self, weights="/home/jnu-ie/kys/Geo-VO/models/superpoint_v6_from_tf.pth",
                  max_keypoints=1000, device="cuda"):
         # 1. 모델 로드 시 보안 및 경고 해결
         self.model = SuperPoint(max_num_keypoints=max_keypoints).to(device)
