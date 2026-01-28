@@ -9,21 +9,15 @@ from scipy.spatial import Delaunay
 
 from src.model import VO
 from CFG.vo_cfg import vo_cfg
-
-import os
-import cv2
-import torch
-import numpy as np
-from torch.utils.data import Dataset
+from src.extractor import SuperPointExtractor
+from src.matcher import LightGlueMatcher
 
 def read_calib_file(path):
-    """KITTI calib.txt 파일을 읽어 딕셔너리로 반환합니다."""
-    float_chars = set("0123456789.e+- ")
     data = {}
     with open(path, 'r') as f:
         for line in f.readlines():
+            if not line.strip(): continue
             key, value = line.split(':', 1)
-            value = value.strip()
             data[key] = np.array([float(x) for x in value.split()])
     return data
 
@@ -35,21 +29,17 @@ class PreprocessDataset(Dataset):
 
         for seq in sequences:
             calib_path = os.path.join(data_root, seq, 'calib.txt')
-            if not os.path.exists(calib_path):
-                print(f"⚠️ {seq}: calib.txt를 찾을 수 없습니다.")
-                continue
+            if not os.path.exists(calib_path): continue
             
             calib_data = read_calib_file(calib_path)
             P2 = np.reshape(calib_data['P2'], (3, 4))
             fx, fy, cx, cy = P2[0, 0], P2[1, 1], P2[0, 2], P2[1, 2]
 
             img_dir = os.path.join(data_root, seq, 'image_2')
-            if not os.path.exists(img_dir): continue
-            
             img_names = sorted([f for f in os.listdir(img_dir) if f.endswith('.png')])
+            
             first_img = cv2.imread(os.path.join(img_dir, img_names[0]))
             H_raw = first_img.shape[0]
-
             cy_corrected = cy - (H_raw % 32)
             
             self.calib_dict[seq] = np.array([
@@ -58,7 +48,6 @@ class PreprocessDataset(Dataset):
                 [0,  0,  1]
             ], dtype=np.float32)
 
-            # 4. 샘플 리스트 생성
             for name in img_names:
                 self.samples.append({
                     'seq': seq,
@@ -67,152 +56,132 @@ class PreprocessDataset(Dataset):
                     'img_path_3': os.path.join(data_root, seq, 'image_3', name)
                 })
 
-    def __len__(self):
-        return len(self.samples)
+    def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        seq = s['seq']
         imgs_processed = []
-        
         for p in [s['img_path_2'], s['img_path_3']]:
             img = cv2.imread(p)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             H, W, _ = img.shape
-            
-            top_crop = H % 32
-            img = img[top_crop:, :1216]
-            
-            
+            img = img[H % 32:, :1216] 
             imgs_processed.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
         
         return {
             'images': torch.stack(imgs_processed), 
-            'seq': seq,
+            'seq': s['seq'],
             'imgnum': s['imgnum'],
-            'K': self.calib_dict[seq] 
+            'K': self.calib_dict[s['seq']] 
         }
 
-def save_worker(task_data):
-    try:
-        kpts = task_data['kpts'] # [N, 2]
-        descs = task_data['node_features'] # [N, 256]
-        scores = task_data['scores'] # [N]
-        
-        # 1. 유효성 마스크 생성 (패딩된 0좌표 제외)
-        mask = np.linalg.norm(kpts, axis=1) > 0
-        
-        # 2. Delaunay Triangulation 및 삼각형 법선 벡터 (R 추정용)
-        valid_kpts = kpts[mask]
-        tri_normals = np.array([])
-        tri_indices = np.array([])
-        
-        if len(valid_kpts) >= 3:
-            dt = Delaunay(valid_kpts)
-            tri_indices = dt.simplices
-            # 단순 예시: 삼각형의 외적을 통한 가상 법선 벡터 계산 (소실점 투표 활용)
-            # 실제 연구 수식에 따라 이 부분을 tri_normals 계산 로직으로 교체하세요.
-            tri_normals = np.zeros((len(tri_indices), 3)) 
+class GeoVOPreprocess:
+    def __init__(self, extractor, matcher, baseline=0.54):
+        self.extractor = extractor
+        self.matcher = matcher
+        self.baseline = baseline
 
+    def compute_3d(self, kpts_l, kpts_r, matches_dict, K):
+        matches = matches_dict['matches'][0].cpu().numpy()
+        idx_l, idx_r = matches[:, 0], matches[:, 1]
+
+        pts_3d = np.zeros((kpts_l.shape[0], 3), dtype=np.float32)
+        disp = kpts_l[idx_l, 0] - kpts_r[idx_r, 0]
+        
+        valid = disp > 0.1
+        idx_l_v, disp_v = idx_l[valid], disp[valid]
+
+        fx, cx, cy = K[0, 0], K[0, 2], K[1, 2]
+        z = (fx * self.baseline) / disp_v
+
+        pts_3d[idx_l_v, 0] = (kpts_l[idx_l_v, 0] - cx) * z / fx
+        pts_3d[idx_l_v, 1] = (kpts_l[idx_l_v, 1] - cy) * z / fx
+        pts_3d[idx_l_v, 2] = z
+        return pts_3d
+
+    @torch.no_grad()
+    def process_pair(self, batch_t, batch_tp1):
+        k_t_l, d_t_l = self.extractor(batch_t['images'][:, 0])
+        k_t_r, d_t_r = self.extractor(batch_t['images'][:, 1])
+        k_tp1_l, d_tp1_l = self.extractor(batch_tp1['images'][:, 0])
+
+        stereo_matches = self.matcher(
+            {'keypoints': k_t_l, 'descriptors': d_t_l},
+            {'keypoints': k_t_r, 'descriptors': d_t_r}
+        )
+
+        temporal_matches = self.matcher(
+            {'keypoints': k_t_l, 'descriptors': d_t_l},
+            {'keypoints': k_tp1_l, 'descriptors': d_tp1_l}
+        )
+
+        K = batch_t['K'][0].cpu().numpy()
+        kpts_np = k_t_l[0].cpu().numpy()
+        pts_3d = self.compute_3d(kpts_np, k_t_r[0].cpu().numpy(), stereo_matches, K)
+        
+        mask = np.linalg.norm(kpts_np, axis=1) > 0
+        tri_indices = np.array([], dtype=np.int32)
+        if np.sum(mask) >= 3:
+            tri_indices = Delaunay(kpts_np[mask]).simplices
+
+        return {
+            'kpts': kpts_np,
+            'pts_3d': pts_3d,
+            'descs': d_t_l[0].cpu().numpy(),
+            'temporal_matches': temporal_matches['matches'][0].cpu().numpy(),
+            'match_scores': temporal_matches['scores'][0].cpu().numpy(),
+            'mask': mask,
+            'tri_indices': tri_indices,
+            'K': K
+        }
+
+def save_worker_pair(task_data):
+    try:
+        res = task_data['result']
         full_save_path = os.path.join(task_data['save_dir'], task_data['rel_path'] + ".npz")
         os.makedirs(os.path.dirname(full_save_path), exist_ok=True)
-
         np.savez_compressed(
             full_save_path,
-            kpts=kpts.astype(np.float32),
-            descs=descs.astype(np.float16),
-            scores=scores.astype(np.float32),
-            mask=mask.astype(np.bool_),
-            tri_indices=tri_indices.astype(np.int32),
-            tri_normals=tri_normals.astype(np.float32),
-            K=task_data['K'].astype(np.float32),
-            image_size=np.array([352, 1216], dtype=np.float32)
+            kpts=res['kpts'].astype(np.float32),
+            pts_3d=res['pts_3d'].astype(np.float32),
+            descs=res['descs'].astype(np.float16),
+            temporal_matches=res['temporal_matches'].astype(np.int32),
+            match_scores=res['match_scores'].astype(np.float32),
+            mask=res['mask'].astype(np.bool_),
+            tri_indices=res['tri_indices'].astype(np.int32),
+            K=res['K'].astype(np.float32)
         )
     except Exception as e:
-        print(f"❌ 저장 에러: {e}")
+        print(f"저장 에러: {e}")
 
-# --- [3] 병렬 추출 루프 ---
 @torch.no_grad()
-def export_parallel(model, dataloader, save_dir, num_cpu):
-    model.eval()
-    device = torch.device('cuda')
-    model.to(device)
+def export_parallel(extractor, matcher, dataloader, save_dir, num_cpu):
+    processor = GeoVOPreprocess(extractor, matcher)
     pool = mp.Pool(processes=num_cpu)
-    async_results = []
-
-    for batch in tqdm(dataloader, desc="⚙️ 통합 전처리 중"):
-        images = batch['images'].to(device)
-        B = images.shape[0]
-        K_batch = batch['K'].numpy()
-
-        for side_idx, side_name in zip([0, 1], ['image_2', 'image_3']):
-            # [수정] 모델에서 점수(scores)까지 함께 추출하도록 인터페이스 확인 필요
-            kpts, descs = model.extractor(images[:, side_idx])
-            # SuperPoint에서 score를 따로 뽑는 로직이 없다면 임의의 1.0으로 초기화 가능
-            scores = torch.ones(B, kpts.shape[1], device=device) 
-
-            tasks = []
-            for b in range(B):
-                rel_path = os.path.join(batch['seq'][b], side_name, f"{int(batch['imgnum'][b]):06d}")
-                tasks.append({
-                    'kpts': kpts[b].cpu().numpy(),
-                    'node_features': descs[b].cpu().numpy(),
-                    'scores': scores[b].cpu().numpy(),
-                    'K': K_batch[b],
-                    'rel_path': rel_path,
-                    'save_dir': save_dir
-                })
+    
+    data_list = list(dataloader)
+    for i in tqdm(range(len(data_list) - 1), desc="Pair 전처리 중"):
+        batch_t = data_list[i]
+        batch_tp1 = data_list[i+1]
+        if batch_t['seq'][0] != batch_tp1['seq'][0]: continue
             
-            res = pool.map_async(save_worker, tasks)
-            async_results.append(res)
-
-        if len(async_results) > 40:
-            for r in async_results[:20]: r.wait()
-            async_results = async_results[20:]
+        result = processor.process_pair(batch_t, batch_tp1)
+        rel_path = os.path.join(batch_t['seq'][0], f"pair_{int(batch_t['imgnum'][0]):06d}_{int(batch_tp1['imgnum'][0]):06d}")
+        pool.apply_async(save_worker_pair, ({'result': result, 'rel_path': rel_path, 'save_dir': save_dir},))
 
     pool.close()
     pool.join()
 
 if __name__ == "__main__":
-    # 1. 경로 설정 (사용자 환경에 맞춰 확인 필요)
     RAW_DATA_PATH = "/home/jnu-ie/Dataset/kitti_odometry/data_odometry_color/dataset/sequences" 
     SAVE_PATH = "/home/jnu-ie/kys/Geo-VO/gendata/precomputed"
-    
-    # 처리할 시퀀스 리스트 (00~08)
     SEQUENCES = [f"{i:02d}" for i in range(9)] 
     
-    # 2. 모델 및 설정 초기화
-    # 전처리 시에는 precomputed 데이터를 쓰지 않으므로 False 설정
-    vo_cfg.use_precomputed = False 
-    
-    print("Geo-VO 모델 로드 중...")
-    model = VO(vo_cfg)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    
-    # 3. 데이터셋 및 데이터로더 생성
+    extractor = SuperPointExtractor(max_keypoints=1000)
+    matcher = LightGlueMatcher(feature_type='superpoint')
+
     dataset = PreprocessDataset(RAW_DATA_PATH, SEQUENCES)
-    print(f"🔎 총 샘플 수: {len(dataset)}")
-    
-    if len(dataset) == 0:
-        print("데이터를 찾지 못했습니다. RAW_DATA_PATH를 확인해주세요.")
-    else:
-        # num_workers는 데이터 로드 병렬화, num_cpu는 저장(save_worker) 병렬화에 사용됩니다.
-        dataloader = DataLoader(
-            dataset, 
-            batch_size=vo_cfg.batchsize, 
-            num_workers=4, 
-            shuffle=False,
-            drop_last=False
-        )
-        
-        print(f"전처리를 시작합니다. (저장 경로: {SAVE_PATH})")
-        export_parallel(
-            model=model, 
-            dataloader=dataloader, 
-            save_dir=SAVE_PATH, 
-            num_cpu=vo_cfg.num_cpu
-        )
-        
-        print(f"\n모든 시퀀스 전처리 완료!")
-        print(f"결과물 확인: {os.listdir(SAVE_PATH)}")
+    if len(dataset) > 0:
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+        export_parallel(extractor, matcher, dataloader, SAVE_PATH, num_cpu=vo_cfg.num_cpu)
+        print(f"✨ Geo-VO 통합 전처리 완료!")
