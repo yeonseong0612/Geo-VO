@@ -41,3 +41,39 @@ def compute_projection_jacobian(kpts_2d, depth, intrinsics):
     J_d = J_p[:, :, :, 2:3].clone() 
 
     return J_p, J_d
+
+def compute_geometry_data(pts_3d, kpts_target, pose, depth, intrinsics):
+    """
+    pts_3d: [B, N, 3] (현재 프레임의 3D 좌표)
+    kpts_target: [B, N, 2] (타겟 프레임의 관측된 2D 특징점 좌표)
+    pose: [B, 1] (lietorch SE3 객체, 확장된 상태)
+    depth: [B, N, 1] (현재 추정된 깊이)
+    intrinsics: [B, 4] (fx, fy, cx, cy)
+    """
+    B, N, _ = pts_3d.shape
+    device = pts_3d.device
+
+    # 1. 3D 포인트 변환 (Current -> Target)
+    # pose: [B, 1, 7], pts_3d: [B, N, 3] -> 결과: [B, N, 3]
+    pts_tp1_pred_3d = pose * pts_3d 
+
+    # 2. 2D 투영 (Perspective Projection)
+    fx, fy, cx, cy = intrinsics[:, 0], intrinsics[:, 1], intrinsics[:, 2], intrinsics[:, 3]
+    
+    # 차원 맞추기
+    fx = fx.view(B, 1); fy = fy.view(B, 1); cx = cx.view(B, 1); cy = cy.view(B, 1)
+    
+    X, Y, Z = pts_tp1_pred_3d[..., 0:1], pts_tp1_pred_3d[..., 1:2], pts_tp1_pred_3d[..., 2:3]
+    inv_Z = 1.0 / Z.clamp(min=0.1)
+
+    u_pred = fx * X * inv_Z + cx
+    v_pred = fy * Y * inv_Z + cy
+    kpts_pred = torch.cat([u_pred, v_pred], dim=-1) # [B, N, 2]
+
+    # 3. Residual 계산 (Observed - Predicted)
+    r = kpts_target - kpts_pred # [B, N, 2]
+
+    # 4. Jacobian 계산
+    J_p, J_d = compute_projection_jacobian(kpts_pred, Z, intrinsics)
+
+    return r, J_p, J_d

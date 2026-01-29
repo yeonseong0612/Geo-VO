@@ -101,42 +101,57 @@ class GeoVOPreprocess:
 
     @torch.no_grad()
     def process_pair(self, batch_t, batch_tp1):
+        # 1. 특징점 및 디스크립터 추출
         k_t_l, d_t_l = self.extractor(batch_t['images'][:, 0])
         k_t_r, d_t_r = self.extractor(batch_t['images'][:, 1])
         k_tp1_l, d_tp1_l = self.extractor(batch_tp1['images'][:, 0])
 
+        # 2. 매칭 수행 (Stereo & Temporal)
         stereo_matches = self.matcher(
             {'keypoints': k_t_l, 'descriptors': d_t_l},
             {'keypoints': k_t_r, 'descriptors': d_t_r}
         )
 
-        temporal_matches = self.matcher(
+        temporal_matches_dict = self.matcher(
             {'keypoints': k_t_l, 'descriptors': d_t_l},
             {'keypoints': k_tp1_l, 'descriptors': d_tp1_l}
         )
 
+        # 3. 데이터 준비
         K = batch_t['K'][0].cpu().numpy()
-        kpts_np = k_t_l[0].cpu().numpy()
-        pts_3d = self.compute_3d(kpts_np, k_t_r[0].cpu().numpy(), stereo_matches, K)
+        kpts_t_np = k_t_l[0].cpu().numpy()
+        kpts_tp1_raw = k_tp1_l[0].cpu().numpy()
+        temp_matches = temporal_matches_dict['matches'][0].cpu().numpy() # [M, 2]
         
-        mask = np.linalg.norm(kpts_np, axis=1) > 0
+        N = kpts_t_np.shape[0]
+
+        kpts_tp1_aligned = np.zeros_like(kpts_t_np) 
+        
+        if temp_matches.shape[0] > 0:
+            idx_t = temp_matches[:, 0]
+            idx_tp1 = temp_matches[:, 1]
+            kpts_tp1_aligned[idx_t] = kpts_tp1_raw[idx_tp1]
+        # -------------------------------------
+
+        pts_3d = self.compute_3d(kpts_t_np, k_t_r[0].cpu().numpy(), stereo_matches, K)
+        
+        mask = np.linalg.norm(kpts_t_np, axis=1) > 0
         valid_indices = np.where(mask)[0]
-        
         tri_indices = np.array([], dtype=np.int32)
 
         if len(valid_indices) >= 3:
-            dt = Delaunay(kpts_np[mask])
-            
+            dt = Delaunay(kpts_t_np[mask])
             tri_indices = valid_indices[dt.simplices].astype(np.int32)
+
         return {
-            'kpts': kpts_np,
+            'kpts': kpts_t_np,
             'pts_3d': pts_3d,
-            'descs': d_t_l[0].cpu().numpy(),
-            'kpts_tp1': k_tp1_l[0].cpu().numpy(), 
-            'temporal_matches': temporal_matches['matches'][0].cpu().numpy(),
-            'match_scores': temporal_matches['scores'][0].cpu().numpy(),
+            'descs': d_t_l[0].cpu().numpy(),     
+            'kpts_tp1': kpts_tp1_aligned,          
+            'temporal_matches': temp_matches,
+            'match_scores': temporal_matches_dict['scores'][0].cpu().numpy(),
             'mask': mask,
-            'tri_indices': tri_indices, # 위 2번 항목(인덱스 매핑) 확인 필요!
+            'tri_indices': tri_indices,
             'K': K
         }
 

@@ -4,37 +4,35 @@ from lietorch import SE3
 
 def pose_geodesic_loss(poses_h, gt_pose, gamma=0.8):
     """
-    [Inputs]
-    - poses_h: List of SE3 objects (length: iters)
-    - gt_pose: SE3 object or [B, 7] tensor
+    poses_h: List of [B, 4, 4] matrices or SE3 objects
+    gt_pose: SE3 object [B]
     """
     n_iters = len(poses_h)
-    
-    if isinstance(gt_pose, torch.Tensor):
-        gt_pose = SE3(gt_pose)
-        
     total_loss = 0.0
     final_t_err = 0.0
     final_r_err = 0.0
     
     for i in range(n_iters):
+        # 만약 matrix 형태([B, 4, 4])로 들어온다면 SE3로 변환
         pred_pose = poses_h[i]
+        if isinstance(pred_pose, torch.Tensor) and pred_pose.shape[-2:] == (4, 4):
+            # matrix_to_7vec 유틸리티를 쓰거나 직접 변환
+            from utils.geo_utils import matrix_to_quat
+            q = matrix_to_quat(pred_pose[:, :3, :3])
+            t = pred_pose[:, :3, 3]
+            pred_pose = SE3(torch.cat([t, q], dim=-1))
         
-        # Geodesic distance on SE(3)
-        # dP = pred * gt.inv()
-        diff = pred_pose * gt_pose.inv()
-        v = diff.log() # [B, 6]
+        # Geodesic distance: ln(T_gt^-1 * T_pred)
+        diff = gt_pose.inv() * pred_pose
+        v = diff.log() # [B, 6] (v, omega)
         
         t_err = v[:, :3].norm(dim=-1).mean()
         r_err = v[:, 3:].norm(dim=-1).mean()
         
-        # Exponential discounting
         weight = gamma ** (n_iters - i - 1)
-
-        # 1m 오차와 약 0.5도 오차를 비슷한 중요도로 설정 (t:1, r:100)
+        # Translation(m) vs Rotation(rad) 스케일 밸런싱
         total_loss += weight * (1.0 * t_err + 100.0 * r_err)
         
-        # 마지막 이터레이션의 에러를 기록 (모니터링용)
         if i == n_iters - 1:
             final_t_err = t_err.item()
             final_r_err = r_err.item()
@@ -45,34 +43,32 @@ def weight_reg_loss(weight_history, gamma=0.8):
     n_iters = len(weight_history)
     loss = 0.0
     for i in range(n_iters):
-        w = weight_history[i][..., 0:1] # Confidence channel
+        w = weight_history[i] # [B, N, 1]
         
-        # 1. 가중치 하한선 강제 (0으로 죽는 것 방지)
-        # 가중치가 0.01보다 작아지면 급격하게 로스를 부여합니다.
-        # 이를 통해 자코비안이 Singular Matrix가 되는 것을 물리적으로 막습니다.
+        # 가중치가 너무 작아져서 Solver가 NaN을 뱉는 것을 방지 (System Stability)
         floor_loss = torch.relu(0.1 - w).mean() 
-        
-        # 2. 기존의 1.0 정규화 (편식 억제)
+        # 가중치가 1 근처에 머물도록 유도 (편식 방지)
         reg = torch.pow(w - 1.0, 2).mean()
         
         step_weight = gamma**(n_iters - i - 1)
-        # 하한선 로스 비중을 높게 설정하여 시스템 안정성을 최우선으로 합니다.
         loss += step_weight * (reg + 10.0 * floor_loss)
         
     return loss
 
-def total_loss(outputs, gt_pose_tensor):
-    poses_h = outputs['poses']
-    weights_h = outputs['weights']
+def total_loss(outputs, batch):
+    """
+    outputs: {'pose_matrices': [...], 'confidences': [...]}
+    batch: {'rel_pose': [B, 7]}
+    """
+    # 1. Pose Loss
+    gt_pose = SE3(batch['rel_pose'])
+    # VO 모델이 뱉는 pose_matrices는 [B, 4, 4] 리스트라고 가정
+    l_pose, t_err, r_err = pose_geodesic_loss(outputs['pose_matrices'], gt_pose)
     
-    gt_pose = SE3(gt_pose_tensor)
-    l_pose, t_err, r_err = pose_geodesic_loss(poses_h, gt_pose)
-    
-    # 3. 가중치 로스 계산
-    l_weight = weight_reg_loss(weights_h)
+    # 2. Weight Regularization
+    l_weight = weight_reg_loss(outputs['confidences'])
 
-    # [핵심 변경] 가중치 로스 계수를 아주 작게(1e-5)라도 주어 
-    # 최소한의 수치적 안정성(Epsilon 역할)을 확보합니다.
-    t_loss = l_pose + 1e-5 * l_weight 
+    # 최종 손실 합산 (l_weight는 수치적 안정성을 위한 보조 장치)
+    t_loss = l_pose + 1e-4 * l_weight 
     
     return t_loss, t_err, r_err, l_weight.detach()

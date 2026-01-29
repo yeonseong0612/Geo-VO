@@ -105,13 +105,14 @@ class DataFactory(data.Dataset):
             pair_data = np.load(pair_path)
             
             data.update({
-                'kpts': torch.from_numpy(pair_data['kpts']).float(),           # [800, 2]
-                'pts_3d': torch.from_numpy(pair_data['pts_3d']).float(),       # [800, 3]
-                'descs': torch.from_numpy(pair_data['descs']).float(),         # [800, 256]
+                'kpts': torch.from_numpy(pair_data['kpts']).float(),           # [N, 2]
+                'pts_3d': torch.from_numpy(pair_data['pts_3d']).float(),       # [N, 3]
+                'descs': torch.from_numpy(pair_data['descs']).float(),         # [N, 256]
+                'kpts_tp1': torch.from_numpy(pair_data['kpts_tp1']).float(),   # [N, 2] <--- 추가!
                 'temporal_matches': torch.from_numpy(pair_data['temporal_matches']).long(), # [M, 2]
                 'match_scores': torch.from_numpy(pair_data['match_scores']).float(),       # [M]
                 'tri_indices': torch.from_numpy(pair_data['tri_indices']).long(),         # [T, 3]
-                'mask': torch.from_numpy(pair_data['mask']).bool()             # [800]
+                'mask': torch.from_numpy(pair_data['mask']).bool()             # [N]
             })
             
         else:
@@ -155,6 +156,7 @@ def vo_collate_fn(batch):
         result['pts_3d'] = torch.stack([item['pts_3d'] for item in batch])
         result['descs'] = torch.stack([item['descs'] for item in batch])
         result['mask'] = torch.stack([item['mask'] for item in batch])
+        result['kpts_tp1'] = torch.stack([item['kpts_tp1'] for item in batch])
         
         # [중요] 매칭 쌍(M)과 삼각형(T)은 배치마다 수가 다르므로 리스트로 유지
         result['temporal_matches'] = [item['temporal_matches'] for item in batch]

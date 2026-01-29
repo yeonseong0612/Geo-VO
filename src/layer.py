@@ -7,22 +7,24 @@ from torch_geometric.nn import GATv2Conv
 import torch
 import torch.nn as nn
 
+from utils.geo_utils import *
+
 class GeometricGAT(nn.Module):
     def __init__(self, in_channels, hidden_dim=256, heads=4, pos_dim=3):
         super().__init__()
-        # 1. Positional Encoding
+        # 1. [u, v, Depth] Encoder
         self.pos_encoder = nn.Sequential(
             nn.Linear(pos_dim, 32),
             nn.SiLU(),
             nn.Linear(32, 64)
         )
 
-        self.actual_in_channels = in_channels
-        
-        self.res_proj = nn.Linear(self.actual_in_channels, hidden_dim)
+        # 2. Residual Projection
+        self.res_proj = nn.Linear(in_channels, hidden_dim)
 
+        # 3. GATv2 (in_channel = Edge [Δu, Δv, dist])
         self.conv = GATv2Conv(
-            self.actual_in_channels, 
+            in_channels, 
             hidden_dim // heads,
             heads=heads, 
             edge_dim=3,
@@ -30,223 +32,159 @@ class GeometricGAT(nn.Module):
         )
         
         self.norm = nn.LayerNorm(hidden_dim)
-        self.projector = nn.Linear(hidden_dim, 256) 
+        self.projector = nn.Linear(hidden_dim, 256)
         self.SiLU = nn.SiLU()
 
-    def forward(self, x, edge_index, edge_attr=None, kpts=None, pts_3d=None):
+    def forward(self, x, edge_index, kpts, pts_3d, edge_attr=None):
         """
-        x: [N, in_channels]
-        edge_index: [2, E]
-        edge_attr: [E, 3] (Optional)
-        kpts, pts_3d: Initializer 모드일 때 좌표 정보를 합치기 위해 사용
+        x: [N, 256] - desc
+        edge_index: [2, E] - tri_indices
+        kpts: [N, 2] - (u, v)
+        pts_3d: [N, 3] : (X, Y, Z)
+        edge_attr: [E, 3] : [Δu, Δv, dist]
         """
-        # [A] 만약 초기화 단계라면 (좌표 정보가 들어왔다면)
-        # 여기서 256(desc) + 64(pos)를 합쳐서 320차원을 만듭니다.
-        if kpts is not None and pts_3d is not None:
-            norm_uv = kpts / torch.tensor([1216.0, 352.0], device=kpts.device)
-            depth = pts_3d[:, 2:3]
-            pos_feat = self.pos_encoder(torch.cat([norm_uv, depth], dim=-1))
-            x = torch.cat([x, pos_feat], dim=-1) # [N, 320]
-            
-            # 엣지 속성이 없다면 생성
-            if edge_attr is None and edge_index is not None:
-                src, dst = edge_index[0], edge_index[1]
-                rel_uv = norm_uv[dst] - norm_uv[src]
-                dist = torch.norm(rel_uv, dim=-1, keepdim=True)
-                edge_attr = torch.cat([rel_uv, dist], dim=-1)
-
-        identity = self.res_proj(x)
+        # [Step 1] Node = Desc + geo_info
+        # Norm(1216, 352)
+        norm_uv = kpts / torch.tensor([1216.0, 352.0], device=kpts.device)
+        depth = pts_3d[:, 2:3] # Z Value
         
-        if edge_index is None:
-            edge_index = torch.empty((2, 0), dtype=torch.long, device=x.device)
-            edge_attr = torch.empty((0, 3), device=x.device)
+        # [N, 3] -> [N, 64]
+        pos_feat = self.pos_encoder(torch.cat([norm_uv, depth], dim=-1))
+        
+        # [N, 256] + [N, 64] = [N, 320]
+        x = torch.cat([x, pos_feat], dim=-1)
 
+        # [Step 2] Edge_info : [Δu, Δv, dist]
+        if edge_attr is None and edge_index is not None:
+            src, dst = edge_index[0], edge_index[1]
+            rel_uv = norm_uv[dst] - norm_uv[src]            # (Δu, Δv)
+            dist = torch.norm(rel_uv, dim=-1, keepdim=True) # dist
+            edge_attr = torch.cat([rel_uv, dist], dim=-1)   # [E, 3]
+
+        # [Step 3] Identity for Residual
+        identity = self.res_proj(x)
+
+        # [Step 4] GATv2
         out, (edge_index_out, alpha) = self.conv(x, edge_index, edge_attr, return_attention_weights=True)
         
-        # [D] 나머지 로직 동일
+        # [Step 5] Post-processing & Residual Connection
         out = self.norm(out)
         out = self.SiLU(out)
-        out = out + identity
+        out = out + identity 
+        
         out = self.projector(out)
         
-        return out, alpha
-        
+        return out, alpha, edge_attr
 
 class TriangleHead(nn.Module):
-    def __init__(self, node_dim=256):
+    def __init__(self, node_dim=256, hidden_dim=128):
         super().__init__()
-        self.common_mlp = nn.Sequential(
-            nn.Linear(node_dim * 3, 512),
+        self.mlp = nn.Sequential(
+            nn.Linear(node_dim * 3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU()
         )
         
-        # 가중치 (0~1: 이 삼각형을 믿을 수 있는가?)
-        self.weight_layer = nn.Linear(512, 1)
+        # Weight(0~1) : Confidence of Triangle
+        self.weight_head = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
         
-        # 법선 벡터 (3D: 이 삼각형의 기울기는 어떠한가?)
-        self.normal_layer = nn.Linear(512, 3) 
+        # Normal Vector
+        self.normal_head = nn.Linear(hidden_dim, 3) 
 
-    def forward(self, tri_feat):
-        x = self.common_mlp(tri_feat)
-        
-        w_j = torch.sigmoid(self.weight_layer(x))
-        n_j = torch.tanh(self.normal_layer(x)) # -1 ~ 1 사이 벡터
-        n_j = F.normalize(n_j, dim=-1)         # 단위 벡터로 정규화
-        
-        return w_j, n_j
-    
-class GeoVOModel(nn.Module):
-    def __init__(self, sigma_voting=2.0):
-        super().__init__()
-        self.gat = GeometricGAT(in_channels=320)
-        self.tri_head = TriangleHead(node_dim=256)
-        self.sigma_voting = sigma_voting
-
-    def forward(self, node_feat, kpts, pts_3d, tri_indices, focal, cx):        
-        B, N, _ = node_feat.shape
-        device = node_feat.device
-        
+    def forward(self, node_feat, tri_indices):
+        """
+        node_feat: [B, N, 256] - GAT updateed node
+        tri_indices: List of [T, 3]
+        """
+        B = node_feat.shape[0]
         all_weights = []
-        all_R_candidates = []
-        all_xv_j = []
+        all_normals = []
 
         for b in range(B):
-            tris = tri_indices[b]
-            if tris.shape[0] == 0: continue
-            
-            f_tri = torch.cat([
-                node_feat[b, tris[:, 0]], 
-                node_feat[b, tris[:, 1]], 
-                node_feat[b, tris[:, 2]]
-            ], dim=-1)
-            
-            weights, _ = self.tri_head(f_tri)
-            K_j = self.compute_individual_Kj(tris, pts_3d[b]) 
-            R_j = self.batch_svd(K_j)
-            
-            r13 = R_j[:, 0, 2]
-            r33 = R_j[:, 2, 2] + 1e-8
-            xv = focal[b] * (r13 / r33) + cx[b]
-            
+            # 1. Make Trianle Feature[T, 3, 256]
+            f1 = node_feat[b, tri_indices[b][:, 0]]
+            f2 = node_feat[b, tri_indices[b][:, 1]]
+            f3 = node_feat[b, tri_indices[b][:, 2]]
+
+            # 2. Concat Feature[T, 768]
+            f_tri = torch.cat([f1, f2, f3], dim=-1)
+
+            # 3. MLP
+            feat = self.mlp(f_tri)
+
+            # 4. result
+            weights = self.weight_head(feat)    #[T, 1]
+            normals = torch.norm(self.normal_head(feat), p=2, dim=-1, keepdim=True) # [T, 3]
+
             all_weights.append(weights)
-            all_R_candidates.append(R_j)
-            all_xv_j.append(xv)
+            all_normals.append(normals)
+        return all_weights, all_normals
+        
+class PoseInitializer(nn.Module):
+    def __init__(self, in_channels=320, node_dim=256):
+        super().__init__()
+        self.gat = GeometricGAT(in_channels=in_channels, hidden_dim=256)
+        self.tri_head = TriangleHead(node_dim=node_dim)
+
+    def forward(self, descs, kpts, pts_3d, tri_indices, kpts_tp1, intrinsics):
+        B, N, _ = descs.shape
+        device = descs.device
+        # 1. GAT : feuture update
+        edges = tri_indices_to_edges(tri_indices, B, N, device)
+        node_feat_flat, _, edge_attr = self.gat(
+            x=descs.view(-1, 256),
+            edge_index=edges,
+            kpts=kpts.view(-1, 2),
+            pts_3d=pts_3d.view(-1, 3)
+        )
+        node_feat = node_feat_flat.view(B, N, 256)
+
+        # 2. Tringle Weights
+        weights_list, _ = self.tri_head(node_feat, tri_indices)
 
         final_R_list = []
         final_tri_weights = []
-        final_vp_conf = [] # 노드 레벨 신뢰도
-        
+        final_vp_conf = []
+
+        # 3. 배치 루프: 각 배치별 초기 Pose 결정
         for b in range(B):
-            # 1. 미분 가능한 투표로 대표 소실점 결정
-            xv_star = differentiable_voting(all_xv_j[b], all_weights[b], sigma=self.sigma_voting)
-            
-            # 2. 삼각형별 소실점 일치도 (Soft-Inlier 가중치)
-            dist_sq = (all_xv_j[b] - xv_star)**2
-            s_j = torch.exp(-dist_sq / (2 * self.sigma_voting**2)).unsqueeze(-1)
-            
-            # 3. [핵심] vp_conf 생성: 삼각형 가중치를 노드로 뿌려줌
-            # 각 노드가 속한 삼각형들의 s_j 평균이나 최대값을 노드의 신뢰도로 사용
-            node_v_conf = torch.zeros((N, 1), device=device)
             tris = tri_indices[b]
+            w_j = weights_list[b]
+
+            fx, fy, cx, cy = intrinsics[b]
+            ux = (kpts_tp1[b, :, 0] - cx) / fx
+            uy = (kpts_tp1[b, :, 1] - cy) / fy
+            p_tp1_norm = torch.stack([ux, uy, torch.ones_like(ux)], dim=-1) # [N, 3]    
+
+            K_j = compute_individual_Kj(tris, pts_3d[b], p_tp1_norm)
+            R_j_candidates = batch_svd(K_j)
+
+            r13 = R_j_candidates[:, 0, 2]
+            r33 = R_j_candidates[:, 2, 2] + 1e-8
+            xv_j = fx * (r13 / r33) + cx
             
-            # Scatter 연산을 사용하여 각 삼각형 정점들에 s_j 값을 누적
-            # (여러 삼각형에 속한 노드는 더 높은 확신을 가질 수 있음)
-            node_v_conf.scatter_add_(0, tris[:, 0:1], s_j)
-            node_v_conf.scatter_add_(0, tris[:, 1:2], s_j)
-            node_v_conf.scatter_add_(0, tris[:, 2:3], s_j)
-            
-            # 노드별 정규화 (선택 사항: 단순 sum 혹은 counts로 나눠 평균)
-            # 여기서는 0~1 사이로 유지하기 위해 tanh나 적절한 scaling 권장
-            node_v_conf = torch.tanh(node_v_conf) 
+            xv_star = differentiable_voting(xv_j, w_j, sigma=2.0)
 
-            # 4. 최종 Weighted SVD
-            fw = all_weights[b] * s_j
-            R_final = estimate_rotation_svd_differentiable(fw, tris, pts_3d[b])
-            
-            final_R_list.append(R_final)
-            final_tri_weights.append(fw) # 삼각형 가중치 (List of [T, 1])
-            final_vp_conf.append(node_v_conf) # 노드 가중치 ([N, 1])
+            dist_sq = (xv_j - xv_star)**2
+            s_j = torch.exp(-dist_sq / (2 * 2.0**2)).unsqueeze(-1) # [T, 1]
 
-        # 배치를 위해 stack
-        return torch.stack(final_R_list), final_tri_weights, torch.stack(final_vp_conf)
+            combined_weights = w_j * s_j
+            R_init = estimate_rotation_svd_differentiable(
+                combined_weights, tris, pts_3d[b], p_tp1_norm
+            )
 
-    def compute_individual_Kj(self, tri_indices, pts_t, pts_tm1):
-        """각 삼각형별 3x3 상관 행렬 계산"""
-        P_t = pts_t[tri_indices]     # [T, 3, 3]
-        P_tm1 = pts_tm1[tri_indices] # [T, 3, 3]
-        
-        # 중심 정규화
-        P_t_c = P_t - P_t.mean(dim=1, keepdim=True)
-        P_tm1_c = P_tm1 - P_tm1.mean(dim=1, keepdim=True)
-        
-        # [T, 3, 3] = [T, 3, 3] @ [T, 3, 3]
-        return torch.matmul(P_t_c.transpose(-2, -1), P_tm1_c)
+            node_v_conf = torch.zeros((N, 1), device=device)
+            node_v_conf.scatter_add_(0, tris.view(-1, 1).expand(-1, 1), s_j.repeat_interleave(3, dim=0))
+            node_v_conf = torch.tanh(node_v_conf)
 
-    def batch_svd(self, K_j):
-        """삼각형 개수(T)만큼 병렬로 SVD 수행"""
-        # K_j: [T, 3, 3]
-        U, S, Vh = torch.linalg.svd(K_j)
-        V = Vh.mtranspose(-2, -1)
-        R_j = torch.matmul(V, U.transpose(-2, -1))
-        
-        # Determinant 보정 (Batch 단위)
-        det = torch.linalg.det(R_j)
-        d = torch.ones((K_j.size(0), 3), device=K_j.device)
-        d[:, 2] = torch.sign(det)
-        D = torch.diag_embed(d)
-        
-        return V @ D @ U.transpose(-2, -1)
-    
-def estimate_rotation_svd_differentiable(weights, tri_indices, pts_3d_t, pts_3d_tm1):
-        # 1. 데이터 준비 (기존 동일)
-        P_t = pts_3d_t[tri_indices] 
-        P_tm1 = pts_3d_tm1[tri_indices]
-        
-        P_t_centered = P_t - P_t.mean(dim=1, keepdim=True)
-        P_tm1_centered = P_tm1 - P_tm1.mean(dim=1, keepdim=True)
-
-        # 2. K_j 및 K_total 계산
-        K_j = torch.matmul(P_t_centered.transpose(-2, -1), P_tm1_centered)
-        
-        # [주의] 미세한 노이즈(eps)를 더해 SVD 발산 방지
-        K_total = torch.sum(weights.view(-1, 1, 1) * K_j, dim=0)
-        K_total = K_total + torch.eye(3, device=K_total.device) * 1e-6 
-
-        # 3. 미분 가능한 SVD
-        U, S, Vh = torch.linalg.svd(K_total)
-        V = Vh.mtranspose(-2, -1)
-        
-        # 4. Det 보정 로직 (미분 가능하게 수정)
-        # torch.no_grad()를 제거하고 torch.det를 사용하여 부드럽게 연결
-        det = torch.linalg.det(torch.matmul(V, U.transpose(-2, -1)))
-        
-        # Reflection(거울 반전) 방지용 대각 행렬 생성
-        # det가 -1이면 마지막 열의 부호를 바꿈
-        d = torch.ones(3, device=weights.device)
-        d[2] = torch.sign(det) 
-        D = torch.diag(d)
-
-        # R = V @ D @ U^T
-        R_final = V @ D @ U.transpose(-2, -1)
-
-        return R_final
-
-def differentiable_voting(xv_j, weights, img_width=1216, sigma=2.0):
-    # 1. Grid 생성 (0, 1, 2, ..., W-1)
-    grid = torch.arange(img_width, device=xv_j.device).float() # [W]
-    
-    # 2. Gaussian Voting (삼각형별로 가우시안을 뿌려 합산)
-    # [T, 1] - [1, W] -> [T, W]
-    diff_sq = (xv_j.unsqueeze(1) - grid.unsqueeze(0))**2
-    voting_map = torch.sum(weights * torch.exp(-diff_sq / (2 * sigma**2)), dim=0) # [W]
-    
-    # 3. Soft-argmax (최종 소실점 위치 추정)
-    # 온도 파라미터(10.0)를 높일수록 argmax와 비슷해지면서 미분 가능 유지
-    probs = torch.softmax(voting_map * 10.0, dim=0) 
-    xv_star = torch.sum(probs * grid)
-    
-    return xv_star
-    
+            final_R_list.append(R_init)
+            final_tri_weights.append(combined_weights)
+            final_vp_conf.append(node_v_conf)
+        return torch.stack(final_R_list), final_tri_weights, torch.stack(final_vp_conf), edges, edge_attr
 
 
 class DBASolver(nn.Module):
@@ -347,368 +285,62 @@ class GraphUpdateBlock(nn.Module):
     def __init__(self, input_dim=256, hidden_dim=256):
         super().__init__()
         self.hidden_dim = hidden_dim
+        # feature(256) + residual(2) + tri_w(1) + vp_s(1) = 260
+        fused_dim = input_dim + 4 
 
-        # 입력: node_feat(256) + residual(2) + tri_weight(1) + vp_conf(1) = 260차원
-        input_dim = input_dim + 2 + 1 + 1
-
-        self.spatial_gat = GeometricGAT(in_channels=input_dim, hidden_dim=hidden_dim)
+        self.spatial_gat = GeometricGAT(in_channels=fused_dim, hidden_dim=hidden_dim)
         self.norm_gat = nn.LayerNorm(hidden_dim)
         
         self.gru = nn.GRUCell(input_size=hidden_dim, hidden_size=hidden_dim)
         self.norm_h = nn.LayerNorm(hidden_dim)
         
+        # 가중치 헤드: [B, N, 2] -> (Confidence, Damping)
         self.weight_head = nn.Sequential(
             nn.Linear(hidden_dim, 128), nn.SiLU(),
             nn.Linear(128, 2) 
         )
         
+        # 포즈/깊이 업데이트 보폭 (Learnable Step Size)
         self.alpha_pose_head = nn.Sequential(
             nn.Linear(hidden_dim, 64), nn.SiLU(),
-            nn.Linear(64, 1), nn.Sigmoid()
+            nn.Linear(64, 1) # Sigmoid 제거 후 루프 내에서 처리
         )
         self.alpha_depth_head = nn.Sequential(
             nn.Linear(hidden_dim, 64), nn.SiLU(),
-            nn.Linear(64, 1), nn.Sigmoid()
+            nn.Linear(64, 1)
         )
 
-    def forward(self, h, node_feat, r, tri_w, vp_s, edges, edge_attr):        
-        """
-        h: [B, N, hidden_dim] - 이전 hidden state
-        node_feat: [B, N, 256] - GAT 노드 피처
-        r: [B, N, 2] - 현재 재투영 오차 (Residual)
-        tri_w: [B, N, 1] - 삼각형 가중치 (정점별 할당)
-        vp_s: [B, N, 1] - 소실점 일관성 점수 (s_j)
-        edges, edge_attr: 그래프 구조
-        """
+    def forward(self, h, node_feat, r, tri_w, vp_s, edges, edge_attr, intrinsics, kpts, pts_3d):
         B, N, _ = node_feat.shape
-        device = node_feat.device
+        
+        r_norm = r / intrinsics[:, :2].unsqueeze(1) 
+        x_fused = torch.cat([node_feat, r_norm, tri_w, vp_s], dim=-1) # [B, N, 260]
 
-        # 1. 기하학적 정보 주입 (Feature Fusion)
-        x_fused = torch.cat([node_feat, r, tri_w, vp_s], dim=-1) # [B, N, 260]
-        x_flat = x_fused.view(-1, x_fused.size(-1))
-
-        # 2. 그래프 데이터 병합 (배치 처리)
-        flat_edges_list = [edges[i] + i * N for i in range(B)]
-        edges_combined = torch.cat(flat_edges_list, dim=1)
-
-        # 3. Spatial GAT (주변 오차 전파)
-        x_spatial_flat, _ = self.spatial_gat(x_flat, edges_combined, edge_attr)
+        x_spatial_flat, _, _ = self.spatial_gat(
+            x=x_fused.view(-1, x_fused.size(-1)), 
+            edge_index=edges, 
+            edge_attr=edge_attr,
+            kpts=kpts.view(-1, 2),
+            pts_3d=pts_3d.view(-1, 3)
+        )
         x_spatial = self.norm_gat(x_spatial_flat.view(B, N, -1))
 
-        # 4. GRU Update
         h_flat = h.view(-1, self.hidden_dim)
-        x_in_flat = x_spatial.view(-1, self.hidden_dim)
-        
-        h_new_flat = self.gru(x_in_flat, h_flat)
+        h_new_flat = self.gru(x_spatial.view(-1, self.hidden_dim), h_flat)
         h_new = self.norm_h(h_new_flat.view(B, N, -1))
 
-        # 5. Output Heads
-        w_raw = self.weight_head(h_new)
-        conf = torch.sigmoid(w_raw[..., 0:1]) 
+        conf = torch.sigmoid(self.weight_head(h_new)[..., 0:1]) 
         
-        a_p = (self.alpha_pose_head(h_new).mean(dim=1) * 0.1) + 1e-4
-        a_d = (self.alpha_depth_head(h_new) * 0.1) + 1e-4
+        a_p = torch.sigmoid(self.alpha_pose_head(h_new)).mean(dim=1) * 0.1
+        a_d = torch.sigmoid(self.alpha_depth_head(h_new)) * 0.1
+        
         return h_new, conf, a_p, a_d
     
 
 
-    
-    
-class GeometricBottleneck(nn.Module):
-    def __init__(self, visual_dim=768, geo_dim=64, out_dim=256):
-        super().__init__()
-        
-        # 1. 시각적 특징 압축 (Visual Compression)
-        # 3C (768) -> 128로 줄여서 중복 정보 제거
-        self.visual_enc = nn.Sequential(
-            nn.Linear(visual_dim, 256),
-            nn.LayerNorm(256),
-            nn.SiLU(),
-            nn.Linear(256, 128)
-        )
-        
-        # 2. 기하학적 특징 확장 (Geometric Expansion)
-        # 단순 수치가 아닌 '공간적 문맥'으로 변환
-        self.geo_enc = nn.Sequential(
-            nn.Linear(geo_dim, 64),
-            nn.LayerNorm(64),
-            nn.SiLU(),
-            nn.Linear(64, 128)
-        )
-        
-        # 3. 최종 통합 (Feature Fusion)
-        self.fusion = nn.Sequential(
-            nn.Linear(128 + 128, out_dim),
-            nn.LayerNorm(out_dim),
-            nn.SiLU()
-        )
-
-    def forward(self, v_feat, g_feat):
-        # v_feat: [B, N, 768] (nodes_L + stereo_f + temporal_f)
-        # g_feat: [B, N, 5] (inv_d, c_s, dx, dy, c_t)
-        
-        v_emb = self.visual_enc(v_feat)
-        g_emb = self.geo_enc(g_feat)
-        
-        # 시각 정보와 기하 정보가 128:128로 대등하게 만남
-        fused = torch.cat([v_emb, g_emb], dim=-1)
-        return self.fusion(fused)
-    
 
 
 
-
-
-
-
-
-
-
-    
-class CorrBlock(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, fmap1, fmap2):
-        d_k = fmap1.shape[-1]
-        attn = torch.matmul(fmap1, fmap2.transpose(-1,-2)) / (d_k** 0.5)
-
-        prob = torch.softmax(attn, dim=-1)
-
-        corr_feat = torch.matmul(prob, fmap2)
-
-        return corr_feat
-
-
-class CyclicErrorModule(nn.Module):
-    def __init__(self, baseline):
-        super().__init__()
-        self.baseline = baseline
-        self.stereo_offset = None
-        self.stereo_inv = None
-
-    def backproject(self, kpts, depth, intrinsics):
-        """[B, N, 2], [B, N, 1], [B, 4] -> [B, N, 3]"""
-        fx, fy, cx, cy = intrinsics.split(1, dim=-1)
-        z = depth
-        x = (kpts[..., 0:1] - cx.unsqueeze(1)) * z / fx.unsqueeze(1)
-        y = (kpts[..., 1:2] - cy.unsqueeze(1)) * z / fy.unsqueeze(1)
-        return torch.cat([x, y, z], dim=-1)
-
-    def project(self, pts_3d, intrinsics):
-        """[B, N, 3], [B, 4] -> [B, N, 2]"""
-        fx, fy, cx, cy = intrinsics.split(1, dim=-1)
-        x, y, z = pts_3d.split(1, dim=-1)
-        # 0 나누기 방지 (epsilon)
-        z = torch.clamp(z, min=1e-3)
-        px = fx.unsqueeze(1) * (x / z) + cx.unsqueeze(1)
-        py = fy.unsqueeze(1) * (y / z) + cy.unsqueeze(1)
-        return torch.cat([px, py], dim=-1)
-
-    def forward(self, kpts, depth, poses, intrinsics):
-        device = kpts.device
-        
-        # 1. 스테레오 오프셋 초기화
-        if self.stereo_offset is None or self.stereo_offset.device != device:
-            disp_vec = torch.tensor([self.baseline, 0, 0, 0, 0, 0, 1.0], device=device)
-            raw_se3 = SE3.InitFromVec(disp_vec) 
-            self.stereo_offset = raw_se3.view((1, 1)) 
-            self.stereo_inv = self.stereo_offset.inv()
-
-        # 1. 역투영 (Unprojection)
-        pts_3d_Lt = self.backproject(kpts, depth, intrinsics) # [B, N, 3]
-
-        # 2. SE3 객체들의 차원 맞추기 (AssertionError 방지 핵심)
-        curr_poses = poses.view((poses.shape[0], 1)) # [B, 1]
-        
-
-        # 3. Cycle 연산 수행
-        pts_3d_Rt = self.stereo_offset.act(pts_3d_Lt)
-        pts_3d_Rt1 = curr_poses.act(pts_3d_Rt)
-        pts_3d_Lt1 = self.stereo_inv.act(pts_3d_Rt1)
-        pts_3d_Lt_final = curr_poses.inv().act(pts_3d_Lt1)
-        kpts_Lt_final = self.project(pts_3d_Lt_final, intrinsics)
-        return kpts_Lt_final - kpts
-
-
-
-
-class EpipolarCrossAttention(nn.Module):
-    def __init__(self, feature_dim):
-        super().__init__()
-        self.dim = feature_dim
-        
-        self.q_proj = nn.Linear(feature_dim, feature_dim)
-        self.k_proj = nn.Linear(feature_dim, feature_dim)
-        self.v_proj = nn.Linear(feature_dim, feature_dim)
-        self.merge = nn.Linear(feature_dim, feature_dim)
-
-    def forward(self, nodes_L, nodes_R, kpts_L, kpts_R, return_attn=True):
-        """
-        nodes_L: [B, N, C]
-        nodes_R: [B, M, C]
-        kpts_L: [B, N, 2]
-        kpts_R: [B, M, 2]
-        """
-        # --- 차원 방어 시작 ---
-        if nodes_L.dim() == 2:
-            nodes_L = nodes_L.unsqueeze(0) # [N, C] -> [1, N, C]
-            nodes_R = nodes_R.unsqueeze(0)
-            kpts_L = kpts_L.unsqueeze(0)   # [N, 2] -> [1, N, 2]
-            kpts_R = kpts_R.unsqueeze(0)
-        # --- 차원 방어 끝 ---
-        B, N, C = nodes_L.shape
-        M = nodes_R.shape[1]
-
-        # 1. Linear Projection (배치 차원 유지)
-        Q = self.q_proj(nodes_L)  # [B, N, C]
-        K = self.k_proj(nodes_R)  # [B, M, C]
-        V = self.v_proj(nodes_R)  # [B, M, C]
-
-        # 2. 에피폴라 제약 설정 (Batch 대응 인덱싱)
-        # kpts_L[:, :, 1:2] -> [B, N, 1]
-        # kpts_R[:, :, 1].unsqueeze(1) -> [B, 1, M]
-        dist_v = torch.abs(kpts_L[:, :, 1:2] - kpts_R[:, :, 1].unsqueeze(1)) # [B, N, M]
-        dist_u = kpts_L[:, :, 0:1] - kpts_R[:, :, 0].unsqueeze(1)            # [B, N, M]
-        
-        # y축 차이가 적고(수평선), x축 차이가 양수(우측 카메라가 더 좌측에 투영됨)인 구간 마스크
-        mask = (dist_v < 3.0) & (dist_u > 0) & (dist_u < 192)
-
-        # 3. Batch Matrix Multiplication & Masking
-        # K.transpose(1, 2)를 사용해 B를 제외한 N, M 차원만 연산
-        attn = torch.matmul(Q, K.transpose(1, 2)) / (self.dim ** 0.5)   # [B, N, M]
-        attn = attn.masked_fill(~mask, -1e9)
-        attn_weights = F.softmax(attn, dim=-1) # [B, N, M]                      
-        
-        # 4. 특징 및 시차(Disparity) 집계
-        matched_features = torch.matmul(attn_weights, V) # [B, N, C]        
-        
-        # u_L - u_R 가중 평균
-        init_disparity = torch.sum(attn_weights * dist_u, dim=-1, keepdim=True) # [B, N, 1]
-        confidence = mask.any(dim=-1, keepdim=True).float()
-
-        out = self.merge(matched_features)
-        if return_attn:
-            return out, init_disparity, confidence, attn_weights
-        return out, init_disparity, confidence   
-     
-class StereoDepthModule(nn.Module):
-    def __init__(self, feature_dim):
-        super().__init__()
-        # 기하학적 정보를 위한 작은 인코더 추가
-        self.geo_enc = nn.Sequential(
-            nn.Linear(feature_dim + 2, 64),
-            nn.SiLU(),
-            nn.Linear(64, 32)
-        )
-
-    def forward(self, nodes_L, matched_features, init_disp, confidence, intrinsics, baseline):
-        """
-        intrinsics: [B, 4] (fx, fy, cx, cy)
-        baseline: 스칼라 (예: 0.54m)
-        """
-        B, N, _ = nodes_L.shape
-        
-        # 1. fx 추출 (intrinsics의 첫 번째 열)
-        fx = intrinsics[:, 0:1] # [B, 1]
-        fB = fx * baseline      # [B, 1]
-        
-        # 2. 브로드캐스팅을 위한 확장 [B, 1, 1]
-        fB_expanded = fB.unsqueeze(-1) 
-        
-        # 3. Disparity를 Inverse Depth로 변환 (안전한 나눗셈)
-        # fB / depth = disparity -> 1 / depth = disparity / fB
-        inv_depth = torch.clamp(init_disp / (fB_expanded + 1e-8), min=1e-4, max=1.0)
-        depth = 1.0 / (inv_depth + 1e-8)
-        
-        # 4. 특징 융합 (Visual + Geometric)
-        # geo_input: [B, N, C + 1(inv_depth) + 1(confidence)]
-        geo_input = torch.cat([nodes_L, inv_depth, confidence], dim=-1)
-        geo_feat = self.geo_enc(geo_input) # [B, N, 32]
-        
-        # 최종 특징량: 원본 + 매칭된 상대 특징 + 기하학적 깊이 특징
-        updated_nodes = torch.cat([nodes_L, matched_features, geo_feat], dim=-1)
-        
-        return updated_nodes, depth
-    
-class TemporalCrossAttention(nn.Module):
-    def __init__(self, q_dim, kv_dim):
-        super().__init__()
-        self.q_dim = q_dim   # 544 (v_stereo_feat)
-        self.kv_dim = kv_dim # 256 (f_Lt1)
-        
-        # Query는 544에서 변환
-        self.q_proj = nn.Linear(q_dim, 256) # 결과는 256으로 통일
-        # Key, Value는 256에서 변환
-        self.k_proj = nn.Linear(kv_dim, 256)
-        self.v_proj = nn.Linear(kv_dim, 256)
-        
-        self.merge = nn.Linear(256, 256)
-        self.temp_geo_enc = nn.Sequential(
-            nn.Linear(3, 32), # flow_residual(2) + confidence(1)
-            nn.SiLU(),
-            nn.Linear(32, 32)
-        )
-
-    def forward(self, nodes_t, nodes_t1, kpts_t1_pred, kpts_t1_actual, iter_idx):
-        """
-        nodes_t: [B, N, C]
-        nodes_t1: [B, M, C]
-        kpts_t1_pred: [B, N, 2]
-        kpts_t1_actual: [B, M, 2]
-        iter_idx: int
-        """
-        # --- 차원 방어 시작 ---
-        if nodes_t.dim() == 2:
-            nodes_t = nodes_t.unsqueeze(0)
-            nodes_t1 = nodes_t1.unsqueeze(0)
-            kpts_t1_pred = kpts_t1_pred.unsqueeze(0)
-            kpts_t1_actual = kpts_t1_actual.unsqueeze(0)
-        # --- 차원 방어 끝 ---
-        B, N, C = nodes_t.shape
-        M = nodes_t1.shape[1]
-
-        # 1. Iteration 기반 윈도우 사이즈 결정
-        if iter_idx == 0:
-            win_size = 64.0
-        else:
-            win_size = max(4.0, 32.0 / (2 ** (iter_idx - 1)))
-        
-        # 2. Linear Projection (Batch 차원 유지)
-        Q = self.q_proj(nodes_t)   # [B, N, C]
-        K = self.k_proj(nodes_t1)  # [B, M, C]
-        V = self.v_proj(nodes_t1)  # [B, M, C]
-
-        # 3. 로컬 윈도우 마스크 생성 (Batch 대응)
-        # kpts_t1_pred[:, :, 0:1] -> [B, N, 1]
-        # kpts_t1_actual[:, :, 0].unsqueeze(1) -> [B, 1, M]
-        # 결과: [B, N, M]
-        dist_u = torch.abs(kpts_t1_pred[:, :, 0:1] - kpts_t1_actual[:, :, 0].unsqueeze(1))
-        dist_v = torch.abs(kpts_t1_pred[:, :, 1:2] - kpts_t1_actual[:, :, 1].unsqueeze(1))
-
-        mask = (dist_u < win_size) & (dist_v < win_size)
-
-        # 4. Batch Matrix Multiplication (BMM)
-        # Q: [B, N, C], K.transpose(1, 2): [B, C, M]
-        attn = torch.matmul(Q, K.transpose(1, 2)) / (256 ** 0.5)
-        attn = attn.masked_fill(~mask, -1e9)
-        attn_weights = F.softmax(attn, dim=-1)      # [B, N, M]
-
-        # 5. 특성 및 좌표 집계
-        # V: [B, M, C] -> matched_features: [B, N, C]
-        matched_features = torch.matmul(attn_weights, V)
-        # kpts_t1_actual: [B, M, 2] -> matched_kpts: [B, N, 2]
-        matched_kpts = torch.matmul(attn_weights, kpts_t1_actual)
-
-        # 6. Residual 및 Confidence 계산
-        flow_residual = matched_kpts - kpts_t1_pred
-        confidence = mask.any(dim=-1, keepdim=True).float() # [B, N, 1]
-        flow_residual = flow_residual * confidence
-        
-
-        # forward 리턴 직전
-        geo_temp = self.temp_geo_enc(torch.cat([flow_residual, confidence], dim=-1))
-        return self.merge(matched_features), geo_temp, flow_residual, confidence
 
 
 class DescSelector(nn.Module):
