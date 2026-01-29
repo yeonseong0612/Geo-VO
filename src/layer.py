@@ -12,11 +12,14 @@ from utils.geo_utils import *
 class GeometricGAT(nn.Module):
     def __init__(self, in_channels, hidden_dim=256, heads=4, pos_dim=3):
         super().__init__()
+        self.total_in_channels = in_channels
         # 1. [u, v, Depth] Encoder
         self.pos_encoder = nn.Sequential(
             nn.Linear(pos_dim, 32),
+            nn.LayerNorm(32), 
             nn.SiLU(),
-            nn.Linear(32, 64)
+            nn.Linear(32, 64),
+            nn.LayerNorm(64)
         )
 
         # 2. Residual Projection
@@ -24,7 +27,7 @@ class GeometricGAT(nn.Module):
 
         # 3. GATv2 (in_channel = Edge [Δu, Δv, dist])
         self.conv = GATv2Conv(
-            in_channels, 
+            self.total_in_channels, 
             hidden_dim // heads,
             heads=heads, 
             edge_dim=3,
@@ -36,44 +39,40 @@ class GeometricGAT(nn.Module):
         self.SiLU = nn.SiLU()
 
     def forward(self, x, edge_index, kpts, pts_3d, edge_attr=None):
-        """
-        x: [N, 256] - desc
-        edge_index: [2, E] - tri_indices
-        kpts: [N, 2] - (u, v)
-        pts_3d: [N, 3] : (X, Y, Z)
-        edge_attr: [E, 3] : [Δu, Δv, dist]
-        """
         device = x.device
-        # [Step 1] Node = Desc + geo_info
-        # Norm(1216, 352)
-        norm_uv = kpts / torch.tensor([1216.0, 352.0], device=device)
-        depth = pts_3d[:, 2:3]
         
-        # [N, 3] -> [N, 64]
-        cat_input = torch.cat([norm_uv.to(device), depth.to(device)], dim=-1)
+        # [Step 1] 정규화 및 수치 방어
+        norm_uv = kpts / torch.tensor([1216.0, 352.0], device=device)
+        # depth가 너무 크면 로그 스케일로 변환하거나 clamp 고려
+        depth = torch.clamp(pts_3d[:, 2:3], min=0.1, max=100.0) 
+        
+        cat_input = torch.cat([norm_uv, depth], dim=-1)
         pos_feat = self.pos_encoder(cat_input)
         
-        # [N, 256] + [N, 64] = [N, 320]
-        x = torch.cat([x.to(device), pos_feat], dim=-1)
+        # [N, 320]
+        x_combined = torch.cat([x, pos_feat], dim=-1)
 
-        # [Step 2] Edge_info : [Δu, Δv, dist]
+        # [Step 2] Edge_info 안정화
         if edge_attr is None and edge_index is not None:
             src, dst = edge_index[0], edge_index[1]
-            rel_uv = norm_uv[dst] - norm_uv[src]            # (Δu, Δv)
-            dist = torch.norm(rel_uv, dim=-1, keepdim=True) # dist
-            edge_attr = torch.cat([rel_uv, dist], dim=-1).to(device)   # [E, 3]
+            rel_uv = norm_uv[dst] - norm_uv[src]
+            # 거리에 아주 작은 eps를 더해 0 나누기 방지
+            dist = torch.norm(rel_uv, dim=-1, keepdim=True)
+            edge_attr = torch.cat([rel_uv, dist], dim=-1)
 
-        # [Step 3] Identity for Residual
-        identity = self.res_proj(x)
-
-        # [Step 4] GATv2
-        out, (edge_index_out, alpha) = self.conv(x, edge_index, edge_attr, return_attention_weights=True)
+        # [Step 4] GATv2 연산
+        # GAT 내부에서 어텐션 가중치가 폭발하지 않도록 x_combined 스케일 체크
+        out, (edge_index_out, alpha) = self.conv(x_combined, edge_index, edge_attr, return_attention_weights=True)
         
-        # [Step 5] Post-processing & Residual Connection
+        # [Step 5] Residual & Post-processing
+        # identity와 out의 스케일을 맞추기 위해 LayerNorm을 통과한 out 사용
         out = self.norm(out)
-        out = self.SiLU(out)
-        out = out + identity 
         
+        # Residual 연결 전 identity에도 정규화가 되어있는지 확인
+        identity = self.res_proj(x_combined)
+        
+        # 두 값을 더한 후 다시 한번 활성화
+        out = self.SiLU(out + identity) 
         out = self.projector(out)
         
         return out, alpha, edge_attr
@@ -98,32 +97,47 @@ class TriangleHead(nn.Module):
         self.normal_head = nn.Linear(hidden_dim, 3) 
 
     def forward(self, node_feat, tri_indices):
-        """
-        node_feat: [B, N, 256] - GAT updateed node
-        tri_indices: List of [T, 3]
-        """
+        # 1. node_feat 차원 강제 보정 [B, N, C]
+        if node_feat.dim() == 2: # [N, C]인 경우 배치 차원 추가
+            node_feat = node_feat.unsqueeze(0)
+            
         B = node_feat.shape[0]
         all_weights = []
         all_normals = []
 
         for b in range(B):
-            # 1. Make Trianle Feature[T, 3, 256]
-            f1 = node_feat[b, tri_indices[b][:, 0]]
-            f2 = node_feat[b, tri_indices[b][:, 1]]
-            f3 = node_feat[b, tri_indices[b][:, 2]]
+            # [수정] tri_indices[b]가 텐서인지 리스트인지에 따라 안전하게 처리
+            tris = tri_indices[b]
+            if isinstance(tris, list):
+                tris = torch.tensor(tris, device=node_feat.device)
+            
+            # 삼각형이 없는 경우 예외 처리
+            if tris.shape[0] == 0:
+                all_weights.append(torch.zeros((0, 1), device=node_feat.device))
+                all_normals.append(torch.zeros((0, 3), device=node_feat.device))
+                continue
 
-            # 2. Concat Feature[T, 768]
+            # [핵심] 배치 인덱싱을 명확하게 수행
+            # node_feat[b] -> [N, 256]
+            f1 = node_feat[b, tris[:, 0]] # [T, 256]
+            f2 = node_feat[b, tris[:, 1]] # [T, 256]
+            f3 = node_feat[b, tris[:, 2]] # [T, 256]
+
+            # 2. Concat Feature [T, 768]
             f_tri = torch.cat([f1, f2, f3], dim=-1)
 
-            # 3. MLP
+            # 3. MLP 수행
             feat = self.mlp(f_tri)
 
-            # 4. result
-            weights = self.weight_head(feat)    #[T, 1]
-            normals = torch.norm(self.normal_head(feat), p=2, dim=-1, keepdim=True) # [T, 3]
+            # 4. Result 계산
+            weights = self.weight_head(feat)    # [T, 1]
+            normals = self.normal_head(feat)    # [T, 3]
+            # [추가] 정규화 시 0으로 나누기 방지
+            normals = normals / (torch.norm(normals, p=2, dim=-1, keepdim=True) + 1e-8)
 
             all_weights.append(weights)
             all_normals.append(normals)
+            
         return all_weights, all_normals
         
 class PoseInitializer(nn.Module):
@@ -163,7 +177,7 @@ class PoseInitializer(nn.Module):
             p_tp1_norm = torch.stack([ux, uy, torch.ones_like(ux)], dim=-1) # [N, 3]    
 
             K_j = compute_individual_Kj(tris, pts_3d[b], p_tp1_norm)
-            K_j = K_j + torch.randn_like(K_j) * 1e-7
+            K_j = K_j + torch.randn_like(K_j) * 1e-5
             R_j_candidates = batch_svd(K_j)
 
             r13 = R_j_candidates[:, 0, 2]
@@ -222,15 +236,17 @@ class DBASolver(nn.Module):
         H_pp = H_pp + (lmbda * diag_mask) 
         
         # H_dd: [B, N, 1], lmbda: 스칼라, node_lambda: [B, N, 1]
-        H_dd = H_dd + lmbda + node_lambda
+        eps = 1e-6
+        H_dd_safe = H_dd + lmbda + node_lambda
+        H_dd_safe = torch.clamp(H_dd_safe, min=1e-4) # 최소 분모 보장
+        inv_H_dd = 1.0 / H_dd_safe
+        H_pd_invHdd = H_pd * inv_H_dd.view(B, N, 1, 1)
 
-        # 3. Schur Complement 및 inv_H_dd 계산
-        inv_H_dd = 1.0 / (H_dd + 1e-2)
-        H_pd_invHdd = H_pd * inv_H_dd.unsqueeze(-1) # [B, N, 6, 1]
-
-        # H_eff = H_pp - sum(H_pd * inv_H_dd * J_pd^T)
-        H_eff = H_pp - torch.matmul(H_pd_invHdd, H_pd.transpose(-1, -2)).sum(dim=1)
-        H_eff = 0.5 * (H_eff + H_eff.transpose(-1, -2)) # 대칭성 강제 보장
+        term_to_sub = torch.matmul(H_pd_invHdd, H_pd.transpose(-1, -2)).sum(dim=1)
+    
+        # H_eff가 너무 작아지는 것을 방지하기 위해 Ridge 댐핑 강화
+        H_eff = H_pp - term_to_sub
+        H_eff = H_eff + torch.eye(6, device=device).unsqueeze(0) * 1e-2
         
         # g_eff = g_p - sum(H_pd * inv_H_dd * g_d)
         g_eff = g_p - (H_pd_invHdd * g_d.unsqueeze(-1)).sum(dim=1) # [B, 6, 1]
@@ -272,7 +288,7 @@ class PoseDepthUpdater(nn.Module):
 
         # 2. Pose Update: 보폭(a_p) 적용
         # a_p는 우리가 GraphUpdateBlock에서 0.1 스케일로 줄였으므로 안정적입니다.
-        scaled_delta = a_p * delta_pose
+        scaled_delta = a_p * torch.tanh(delta_pose / 2.0) * 2.0
 
         # 리 군(Lie Group) 지수 사상 적용
         delta_SE3 = SE3.exp(scaled_delta)
@@ -288,7 +304,6 @@ class GraphUpdateBlock(nn.Module):
     def __init__(self, input_dim=256, hidden_dim=256):
         super().__init__()
         self.hidden_dim = hidden_dim
-        # feature(256) + residual(2) + tri_w(1) + vp_s(1) = 260
         fused_dim = input_dim + 4 
 
         self.spatial_gat = GeometricGAT(in_channels=fused_dim, hidden_dim=hidden_dim)
@@ -297,16 +312,16 @@ class GraphUpdateBlock(nn.Module):
         self.gru = nn.GRUCell(input_size=hidden_dim, hidden_size=hidden_dim)
         self.norm_h = nn.LayerNorm(hidden_dim)
         
-        # 가중치 헤드: [B, N, 2] -> (Confidence, Damping)
         self.weight_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128), nn.SiLU(),
-            nn.Linear(128, 2) 
+            nn.Linear(hidden_dim, 128),
+            nn.LayerNorm(128), 
+            nn.Tanh(),
+            nn.Linear(128, 2)
         )
         
-        # 포즈/깊이 업데이트 보폭 (Learnable Step Size)
         self.alpha_pose_head = nn.Sequential(
             nn.Linear(hidden_dim, 64), nn.SiLU(),
-            nn.Linear(64, 1) # Sigmoid 제거 후 루프 내에서 처리
+            nn.Linear(64, 1)
         )
         self.alpha_depth_head = nn.Sequential(
             nn.Linear(hidden_dim, 64), nn.SiLU(),
@@ -316,26 +331,28 @@ class GraphUpdateBlock(nn.Module):
     def forward(self, h, node_feat, r, tri_w, vp_s, edges, edge_attr, intrinsics, kpts, pts_3d):
         B, N, _ = node_feat.shape
         
-        r_norm = r / intrinsics[:, :2].unsqueeze(1) 
+        r_norm = r / (intrinsics[:, :2].unsqueeze(1) + 1e-8) 
         x_fused = torch.cat([node_feat, r_norm, tri_w, vp_s], dim=-1) # [B, N, 260]
 
         x_spatial_flat, _, _ = self.spatial_gat(
             x=x_fused.view(-1, x_fused.size(-1)), 
-            edge_index=edges, 
+            edge_index=edges,     
             edge_attr=edge_attr,
-            kpts=kpts.view(-1, 2),
+            kpts=kpts.view(-1, 2), 
             pts_3d=pts_3d.view(-1, 3)
         )
         x_spatial = self.norm_gat(x_spatial_flat.view(B, N, -1))
 
         h_flat = h.view(-1, self.hidden_dim)
         h_new_flat = self.gru(x_spatial.view(-1, self.hidden_dim), h_flat)
+        
+        h_new_flat = torch.clamp(h_new_flat, min=-50.0, max=50.0)
         h_new = self.norm_h(h_new_flat.view(B, N, -1))
 
         conf = torch.sigmoid(self.weight_head(h_new)[..., 0:1]) 
         
-        a_p = torch.sigmoid(self.alpha_pose_head(h_new)).mean(dim=1) * 0.1
-        a_d = torch.sigmoid(self.alpha_depth_head(h_new)) * 0.1
+        a_p = torch.sigmoid(torch.clamp(self.alpha_pose_head(h_new), -10.0, 10.0)).mean(dim=1) * 0.1
+        a_d = torch.sigmoid(torch.clamp(self.alpha_depth_head(h_new), -10.0, 10.0)) * 0.1
         
         return h_new, conf, a_p, a_d
     
@@ -343,102 +360,3 @@ class GraphUpdateBlock(nn.Module):
 
 
 
-
-
-
-class DescSelector(nn.Module):
-    def __init__(self, in_dim=256, out_dim=128):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.LayerNorm(256), 
-            nn.SiLU(),
-            nn.Linear(256, out_dim)
-        )
-        self.score_head = nn.Linear(out_dim, 1)
-        self.out_dim = out_dim
-
-        self.init_weights()
-
-    def init_weights(self):
-        for m in self.mlp:
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
-        nn.init.constant_(self.score_head.weight, 0.001)
-        nn.init.constant_(self.score_head.bias, 0.0)
-        
-
-    def forward(self, kpts, desc, img_shape, top_k=128):
-        """
-        kpts: [B, N, 2], desc: [B, N, 256]
-        img_shape: (H, W)
-        """
-        B, N, _ = kpts.shape
-        H, W = img_shape
-        device = kpts.device
-
-        feat = self.mlp(desc) 
-        scores = self.score_head(feat).squeeze(-1)
-
-        x = kpts[..., 0]
-        y = kpts[..., 1]
-
-        mid_mask = (y > 0.2 * H) & (y <= 0.5 * H)
-        bottom_mask = (y > 0.5 * H)
-        
-        mid_grid_x = (x / W * 8).long().clamp(0, 7)
-        mid_grid_y = ((y - 0.2*H) / (0.3*H) * 4).long().clamp(0, 3)
-        mid_grid_id = mid_grid_y * 8 + mid_grid_x 
-        
-        btm_grid_x = (x / W * 16).long().clamp(0, 15)
-        btm_grid_y = ((y - 0.5*H) / (0.5*H) * 6).long().clamp(0, 5)
-        btm_grid_id = 32 + (btm_grid_y * 16 + btm_grid_x) 
-
-        grid_ids = torch.full((B, N), -1, dtype=torch.long, device=device)
-        grid_ids[mid_mask] = mid_grid_id[mid_mask]
-        grid_ids[bottom_mask] = btm_grid_id[bottom_mask]
-
-
-        final_indices = []
-        for b in range(B):
-            grid_max_scores = torch.full((128,), -1e9, device=device)
-            grid_max_idx = torch.full((128,), -1, dtype=torch.long, device=device)
-            
-            b_grid_ids = grid_ids[b]
-            b_scores = scores[b]
-            
-            valid_pts = b_grid_ids >= 0
-            if valid_pts.any():
-                for i in torch.where(valid_pts)[0]:
-                    g_id = b_grid_ids[i]
-                    if b_scores[i] > grid_max_scores[g_id]:
-                        grid_max_scores[g_id] = b_scores[i]
-                        grid_max_idx[g_id] = i
-            
-            selected_mask = grid_max_idx >= 0
-            selected_idx = grid_max_idx[selected_mask]
-            
-            num_selected = len(selected_idx)
-            if num_selected < top_k:
-                mask = torch.ones(N, dtype=torch.bool, device=device)
-                mask[selected_idx] = False
-                
-                remaining_scores = b_scores.clone()
-                remaining_scores[~mask] = -1e10 
-                
-                _, extra_idx = torch.topk(remaining_scores, top_k - num_selected)
-                batch_final_idx = torch.cat([selected_idx, extra_idx])
-            else:
-                batch_final_idx = selected_idx[:top_k]
-                
-            final_indices.append(batch_final_idx)
-
-        indices = torch.stack(final_indices) # [B, 128]
-        
-        final_feat = torch.gather(desc, 1, indices.unsqueeze(-1).expand(-1, -1, 256))
-        final_kpts = torch.gather(kpts, 1, indices.unsqueeze(-1).expand(-1, -1, 2))
-        
-        return final_feat, final_kpts, indices
-        

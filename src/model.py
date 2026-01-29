@@ -20,10 +20,10 @@ class VO(nn.Module):
         
         # 댐핑 파라미터
         # self.log_lmbda = nn.Parameter(torch.tensor(-4.6))
-        self.log_lmbda = torch.tensor(-2.3)
+        self.log_lmbda = torch.tensor([2.3])
     
 
-    def forward(self, batch, iters=8, mode='train'):
+    def forward(self, batch, iters=4, mode='train'):
         device = next(self.parameters()).device
         if mode == 'train':
             for key in batch.keys():
@@ -64,7 +64,7 @@ class VO(nn.Module):
                     kpts_t, pts_3d_t
                 )
 
-                delta_pose, delta_depth = self.solver(r, conf, J_p, J_d, self.log_lmbda.exp())
+                delta_pose, delta_depth = self.solver(r, conf, J_p, J_d, self.log_lmbda.exp().to(device))
 
                 curr_pose = SE3.exp(a_p * delta_pose) * curr_pose
                 curr_depth = curr_depth + a_d * delta_depth

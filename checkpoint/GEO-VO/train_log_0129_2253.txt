@@ -1,0 +1,5 @@
+Training Start: 2026-01-29 22:53:43.824391
+Anomaly Detection: ON
+Config: Epochs=60, BatchSize=8, LR=1e-06
+----------------------------------------------------------------------------------------------------
+ERROR at Batch 0: Function 'AddmmBackward0' returned nan values in its 2th output.

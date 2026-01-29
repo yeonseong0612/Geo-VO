@@ -89,16 +89,22 @@ def compute_individual_Kj(tri_indices, pts_t, pts_tp1):
 
         return k_j
 
-def batch_svd(K_j):
-    U, S, Vh = torch.linalg.svd(K_j)
+def batch_svd(K):
+    K_norm = torch.norm(K, dim=(-2, -1), keepdim=True) + 1e-8
+    K_scaled = K / K_norm
+
+    K_scaled = K_scaled + torch.randn_like(K_scaled) * 1e-5
+
+    # 3. SVD
+    U, S, Vh = torch.linalg.svd(K_scaled)
+
+    R = torch.matmul(U, Vh)
+    det = torch.linalg.det(R)
     
-    R_j = torch.matmul(U, Vh)
-    
-    det = torch.linalg.det(R_j)
-    d = torch.ones((K_j.size(0), 3), device=K_j.device)
-    d[:, 2] = torch.sign(det)
+    d = torch.ones((K.size(0), 3), device=K.device)
+    d[:, 2] = torch.where(det < 0, -1.0, 1.0)
     D = torch.diag_embed(d)
-    
+
     return U @ D @ Vh
 
 def differentiable_voting(xv_j, weights, img_width=1216, sigma=2.0):
@@ -111,8 +117,7 @@ def differentiable_voting(xv_j, weights, img_width=1216, sigma=2.0):
     voting_map = torch.sum(weights * torch.exp(-diff_sq / (2 * sigma**2)), dim=0) # [W]
     
     # 3. Soft-argmax (최종 소실점 위치 추정)
-    # 온도 파라미터(10.0)를 높일수록 argmax와 비슷해지면서 미분 가능 유지
-    probs = torch.softmax(voting_map * 10.0, dim=0) 
+    probs = torch.softmax(voting_map * 5.0, dim=0) 
     xv_star = torch.sum(probs * grid)
     
     return xv_star
@@ -130,17 +135,18 @@ def estimate_rotation_svd_differentiable(weights, tri_indices, pts_3d_t, pts_3d_
     # 3. K_j 및 가중합 K_total 계산
     K_j = torch.matmul(P_t_centered.transpose(-2, -1), P_tp1_centered)
     K_total = torch.sum(weights.view(-1, 1, 1) * K_j, dim=0)
-    K_total = K_total + torch.eye(3, device=K_total.device) * 1e-6
+    K_total = K_total / (torch.norm(K_total) + 1e-8) 
+    K_total = K_total + torch.randn_like(K_total) * 1e-5
 
     # 4. SVD 수행
     U, S, Vh = torch.linalg.svd(K_total)
     
-    # 5. Det 보정 (SO(3) 제약)
-    # Row Vector 정답 순서인 U @ Vh 기준으로 det 계산
-    det = torch.linalg.det(torch.matmul(U, Vh))
+    R = U @ Vh
+    det = torch.linalg.det(R)
     
     d = torch.ones(3, device=weights.device)
-    d[2] = torch.sign(det) 
+    # sign 함수는 미분 불가능 지점이 있어 where가 더 안전함
+    d[2] = torch.where(det < 0, -1.0, 1.0) 
     D = torch.diag(d)
 
     # 6. 최종 R 추출 (순서 중요: U @ D @ Vh)

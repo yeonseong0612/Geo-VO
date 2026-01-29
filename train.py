@@ -6,7 +6,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm 
 from datetime import datetime
 
@@ -14,6 +13,9 @@ from CFG.vo_cfg import vo_cfg as cfg
 from src.model import VO
 from src.loader import DataFactory, vo_collate_fn
 from src.loss import total_loss
+
+# [추가] 역전파 이상 탐지 활성화 - NaN이 발생한 연산 지점을 정확히 짚어줍니다.
+torch.autograd.set_detect_anomaly(True)
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -49,9 +51,9 @@ def train(rank, world_size, cfg):
     
     raw_model = model.module if is_ddp else model
     
+    # log_lmbda는 상수로 고정되었으므로 제외된 params 리스트 사용
     params = [
-        {'params': [p for n, p in raw_model.named_parameters() if 'log_lmbda' not in n], 'lr': cfg.learning_rate},
-        {'params': [raw_model.log_lmbda], 'lr': 1e-3}
+        {'params': [p for n, p in raw_model.named_parameters() if 'log_lmbda' not in n], 'lr': cfg.learning_rate}
     ]
 
     optimizer = optim.AdamW(params, cfg.weight_decay)
@@ -59,7 +61,6 @@ def train(rank, world_size, cfg):
         optimizer, milestones=cfg.MultiStepLR_milstone, gamma=cfg.MultiStepLR_gamma
     )
 
-    writer = None
     log_file = None
     if rank == 0:
         if not os.path.exists(cfg.logdir):
@@ -68,19 +69,17 @@ def train(rank, world_size, cfg):
         log_path = os.path.join(cfg.logdir, f"train_log_{datetime.now().strftime('%m%d_%H%M')}.txt")
         log_file = open(log_path, "w")
         log_file.write(f"Training Start: {datetime.now()}\n")
+        log_file.write(f"Anomaly Detection: ON\n") # 이상 탐지 모드 기록
         log_file.write(f"Config: Epochs={cfg.maxepoch}, BatchSize={cfg.batchsize}, LR={cfg.learning_rate}\n")
         log_file.write("-" * 100 + "\n")
         log_file.flush()
-
-        writer = SummaryWriter(log_dir=os.path.join(cfg.logdir, 'tensorboard'))
-        print(f"==> 학습 시작: Log 저장위치={log_path}")
+        print(f"==> 학습 시작 (이상 탐지 모드): Log 저장위치={log_path}")
 
     for epoch in range(cfg.maxepoch):
         if is_ddp:
             sampler.set_epoch(epoch)
         
         model.train()
-        # --- 지표 누적 변수 초기화 (l_w 추가) ---
         epoch_loss = 0.0
         epoch_t_err = 0.0
         epoch_r_err = 0.0
@@ -91,42 +90,49 @@ def train(rank, world_size, cfg):
         for i, batch in enumerate(pbar):
             optimizer.zero_grad()
             
-            gt_pose = batch['rel_pose'].to(device)
-            
-            # 모델 호출 (iters는 학습 안정성을 위해 8~12 사이 추천)
+            # Forward 연산
             outputs = model(batch, iters=8) 
+            
             with torch.no_grad():
-                init_R = outputs['pose_matrices'][0] # 첫 번째 이터레이션 포즈
+                init_R = outputs['pose_matrices'][0]
                 det_val = torch.det(init_R[:, :3, :3])
-                print(f"\nDEBUG: Det(R) min={det_val.min().item():.4f}, max={det_val.max().item():.4f}")
-                
-                if torch.isnan(init_R).any():
-                    print("!!! Model output already contains NaN before loss calculation !!!")
+                # Det(R)이 NaN이면 이미 Forward에서 터진 것
+                if torch.isnan(det_val).any():
+                    print(f"\n[Rank {rank}] !!! Forward NaN Detected in Det(R) at Batch {i} !!!")
 
-            # total_loss 호출 (딕셔너리 형태의 outputs 전달)
             loss, t_err, r_err, l_w = total_loss(outputs, batch)
             
             if torch.isnan(loss):
-                print(f"\n[Rank {rank}] Warning: NaN loss detected. Skipping batch {i}.")
+                print(f"\n[Rank {rank}] Warning: NaN loss detected at batch {i}. Skipping.")
                 continue
 
-            loss.backward()
-            
-            # Gradient Clipping (VO 발산 방지의 핵심 가드레일)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # [핵심] Backward 연산 시 이상 탐지 작동
+            try:
+                loss.backward()
+            except RuntimeError as e:
+                print("\n" + "!"*60)
+                print(f"🚨 [Rank {rank}] Backward NaN Detected at Batch {i}!")
+                print(f"Error Details: {e}")
+                print("!"*60)
+                # 로그에 에러 기록 후 종료
+                if rank == 0:
+                    log_file.write(f"ERROR at Batch {i}: {str(e)}\n")
+                    log_file.close()
+                return # 학습 중단
+
+            # 그래디언트 클리핑 (더 보수적으로 0.1 설정)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
             optimizer.step()
 
-            # --- 지표 누적 및 평균 계산 (item() 적극 사용으로 메모리 누수 방지) ---
+            # 지표 업데이트
             epoch_loss += loss.item()
             epoch_t_err += t_err
             epoch_r_err += r_err
             epoch_l_w += l_w.item() if torch.is_tensor(l_w) else l_w
             
-            # 실시간 평균값 계산
             avg_loss = epoch_loss / (i + 1)
             avg_t_err = epoch_t_err / (i + 1)
             avg_r_err = epoch_r_err / (i + 1)
-            avg_l_w = epoch_l_w / (i + 1)
 
             curr_lmbda = torch.exp(raw_model.log_lmbda).item()
 
@@ -138,49 +144,28 @@ def train(rank, world_size, cfg):
                     "Lm": f"{curr_lmbda:.1e}"
                 })
 
-                global_step = epoch * len(loader) + i
-                writer.add_scalar('Batch/Loss', loss.item(), global_step)
-                writer.add_scalar('Batch/Trans_Err', t_err, global_step)
-                writer.add_scalar('Batch/Lambda', curr_lmbda, global_step)
-        # 에포크 종료 후 스케줄러 업데이트
         scheduler.step()
 
         if rank == 0:
             current_lr = optimizer.param_groups[0]['lr']
-            # 로그 파일에는 에포크 전체 평균값을 기록
             log_str = (f"[Epoch {epoch}] AvgL: {avg_loss:.5f} | AvgT: {avg_t_err:.5f} | AvgR: {avg_r_err:.5f} | "
-                       f"WLoss: {l_w:.7f} | Lm: {curr_lmbda:.2e} | LR: {current_lr:.7f}\n")
+                       f"Lm: {curr_lmbda:.2e} | LR: {current_lr:.7f}\n")
             print(f"\n{log_str}")
-            
             log_file.write(log_str)
             log_file.flush()
-
-            writer.add_scalar('Epoch/Avg_Loss', avg_loss, epoch)
-            writer.add_scalar('Epoch/Avg_Trans_Err', avg_t_err, epoch)
-            writer.add_scalar('Epoch/Avg_Rot_Err', avg_r_err, epoch)
-            writer.add_scalar('Epoch/Lambda', curr_lmbda, epoch)
 
             save_path = os.path.join(cfg.logdir, f"vo_model_{epoch}.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': raw_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-                't_err': avg_t_err,
-                'r_err': avg_r_err,
                 'lmbda': curr_lmbda
             }, save_path)
 
     if rank == 0:
         log_file.write(f"Training Finished: {datetime.now()}\n")
         log_file.close()
-        writer.close()
     if is_ddp:
         cleanup()
 
 if __name__ == "__main__":
-    # world_size = torch.cuda.device_count()
-    # if world_size > 1:
-    #     mp.spawn(train, args=(world_size, cfg), nprocs=world_size, join=True)
-    # else:
     train(0, 1, cfg)
