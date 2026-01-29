@@ -28,22 +28,18 @@ def test_full_vo_pipeline():
     # 3. Forward 실행
     print(f"Running VO forward with 8 iterations...")
     try:
-        # predictions는 리스트이며, 각 원소는 {'pose': [B, 4, 4], 'depth': [B, N, 1]}
-        predictions = model(batch, iters=8, mode='train')
-        
-        # 4. 결과 검증
-        print(f"Total predictions stored: {len(predictions)}")
-        
-        # 마지막 이터레이션의 결과 확인
-        final_pose = predictions[-1]['pose']
-        final_depth = predictions[-1]['depth']
-        
-        print(f"Final Pose Shape: {final_pose.shape} (Expected: [1, 4, 4])")
-        print(f"Final Depth Shape: {final_depth.shape} (Expected: [1, 800, 1])")
-        
-        # 포즈가 업데이트 되었는지 확인 (Identity가 아님)
-        is_updated = not torch.allclose(final_pose, torch.eye(4, device=device).unsqueeze(0))
-        print(f"Pose was updated from Identity: {is_updated}")
+        # test_model.py 수정 부분
+        outputs = model(batch, iters=8, mode='train')
+
+        # 이제 outputs는 딕셔너리입니다.
+        predictions_pose = outputs['pose_matrices']
+        predictions_conf = outputs['confidences']
+
+        print(f"Total iterations stored: {len(predictions_pose)}")
+
+        # 마지막 이터레이션의 포즈 가져오기
+        final_pose = predictions_pose[-1] 
+        print(f"Final Pose Shape: {final_pose.shape}")
 
         print("\n✅ [Success] VO 파이프라인 전체 루프가 성공적으로 실행되었습니다.")
         
