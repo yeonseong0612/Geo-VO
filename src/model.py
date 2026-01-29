@@ -19,12 +19,19 @@ class VO(nn.Module):
         self.updater = PoseDepthUpdater()
         
         # 댐핑 파라미터
-        self.log_lmbda = nn.Parameter(torch.tensor(-4.6))
-
+        # self.log_lmbda = nn.Parameter(torch.tensor(-4.6))
+        self.log_lmbda = torch.tensor(-2.3)
     
 
     def forward(self, batch, iters=8, mode='train'):
+        device = next(self.parameters()).device
         if mode == 'train':
+            for key in batch.keys():
+                if torch.is_tensor(batch[key]):
+                    batch[key] = batch[key].to(device)
+                # 만약 tri_indices가 리스트 안에 텐서가 든 형태라면 (Collate 시)
+                elif isinstance(batch[key], list):
+                    batch[key] = [t.to(device) if torch.is_tensor(t) else t for t in batch[key]]
             kpts_t = batch['kpts']           # [B, 800, 2] (현재 프레임 특징점)
             pts_3d_t = batch['pts_3d']       # [B, 800, 3] (현재 프레임 3D)
             descs = batch['descs']           # [B, 800, 320]
@@ -34,7 +41,6 @@ class VO(nn.Module):
             intrinsics = batch['calib']      # [B, 4] (fx, fy, cx, cy)
 
             B, N, _ = kpts_t.shape
-            device = kpts_t.device
             
             R_init, tri_w, vp_conf, edge, edge_attr = self.initializer(descs, kpts_t, pts_3d_t, tri_indices, kpts_tp1, intrinsics)
    

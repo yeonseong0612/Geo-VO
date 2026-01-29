@@ -43,23 +43,25 @@ class GeometricGAT(nn.Module):
         pts_3d: [N, 3] : (X, Y, Z)
         edge_attr: [E, 3] : [Δu, Δv, dist]
         """
+        device = x.device
         # [Step 1] Node = Desc + geo_info
         # Norm(1216, 352)
-        norm_uv = kpts / torch.tensor([1216.0, 352.0], device=kpts.device)
-        depth = pts_3d[:, 2:3] # Z Value
+        norm_uv = kpts / torch.tensor([1216.0, 352.0], device=device)
+        depth = pts_3d[:, 2:3]
         
         # [N, 3] -> [N, 64]
-        pos_feat = self.pos_encoder(torch.cat([norm_uv, depth], dim=-1))
+        cat_input = torch.cat([norm_uv.to(device), depth.to(device)], dim=-1)
+        pos_feat = self.pos_encoder(cat_input)
         
         # [N, 256] + [N, 64] = [N, 320]
-        x = torch.cat([x, pos_feat], dim=-1)
+        x = torch.cat([x.to(device), pos_feat], dim=-1)
 
         # [Step 2] Edge_info : [Δu, Δv, dist]
         if edge_attr is None and edge_index is not None:
             src, dst = edge_index[0], edge_index[1]
             rel_uv = norm_uv[dst] - norm_uv[src]            # (Δu, Δv)
             dist = torch.norm(rel_uv, dim=-1, keepdim=True) # dist
-            edge_attr = torch.cat([rel_uv, dist], dim=-1)   # [E, 3]
+            edge_attr = torch.cat([rel_uv, dist], dim=-1).to(device)   # [E, 3]
 
         # [Step 3] Identity for Residual
         identity = self.res_proj(x)
@@ -152,15 +154,16 @@ class PoseInitializer(nn.Module):
 
         # 3. 배치 루프: 각 배치별 초기 Pose 결정
         for b in range(B):
-            tris = tri_indices[b]
+            tris = tri_indices[b].to(device)
             w_j = weights_list[b]
 
             fx, fy, cx, cy = intrinsics[b]
-            ux = (kpts_tp1[b, :, 0] - cx) / fx
-            uy = (kpts_tp1[b, :, 1] - cy) / fy
+            ux = (kpts_tp1[b, :, 0] - cx) / (fx + 1e-8)
+            uy = (kpts_tp1[b, :, 1] - cy) / (fy + 1e-8)
             p_tp1_norm = torch.stack([ux, uy, torch.ones_like(ux)], dim=-1) # [N, 3]    
 
             K_j = compute_individual_Kj(tris, pts_3d[b], p_tp1_norm)
+            K_j = K_j + torch.randn_like(K_j) * 1e-7
             R_j_candidates = batch_svd(K_j)
 
             r13 = R_j_candidates[:, 0, 2]

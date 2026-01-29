@@ -100,7 +100,7 @@ class DataFactory(data.Dataset):
                         
             if not os.path.exists(pair_path):
                 # 파일이 없을 경우 에러 메시지 출력 후 다음 단계 진행을 위해 예외 처리 권장
-                raise FileNotFoundError(f"❌ Pair 파일을 찾을 수 없습니다: {pair_path}")
+                raise FileNotFoundError(f"Pair 파일을 찾을 수 없습니다: {pair_path}")
             
             pair_data = np.load(pair_path)
             

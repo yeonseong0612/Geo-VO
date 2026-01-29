@@ -37,7 +37,7 @@ def train(rank, world_size, cfg):
         dataset, 
         batch_size=cfg.batchsize, 
         shuffle=(sampler is None),
-        num_workers=2,
+        num_workers=0,
         sampler=sampler, 
         collate_fn=vo_collate_fn,
         pin_memory=True
@@ -45,7 +45,7 @@ def train(rank, world_size, cfg):
 
     model = VO(cfg).to(device)
     if is_ddp:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     
     raw_model = model.module if is_ddp else model
     
@@ -53,7 +53,7 @@ def train(rank, world_size, cfg):
         {'params': [p for n, p in raw_model.named_parameters() if 'log_lmbda' not in n], 'lr': cfg.learning_rate},
         {'params': [raw_model.log_lmbda], 'lr': 1e-3}
     ]
-    
+
     optimizer = optim.AdamW(params, cfg.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=cfg.MultiStepLR_milstone, gamma=cfg.MultiStepLR_gamma
@@ -95,9 +95,16 @@ def train(rank, world_size, cfg):
             
             # 모델 호출 (iters는 학습 안정성을 위해 8~12 사이 추천)
             outputs = model(batch, iters=8) 
+            with torch.no_grad():
+                init_R = outputs['pose_matrices'][0] # 첫 번째 이터레이션 포즈
+                det_val = torch.det(init_R[:, :3, :3])
+                print(f"\nDEBUG: Det(R) min={det_val.min().item():.4f}, max={det_val.max().item():.4f}")
+                
+                if torch.isnan(init_R).any():
+                    print("!!! Model output already contains NaN before loss calculation !!!")
 
             # total_loss 호출 (딕셔너리 형태의 outputs 전달)
-            loss, t_err, r_err, l_w = total_loss(outputs, gt_pose)
+            loss, t_err, r_err, l_w = total_loss(outputs, batch)
             
             if torch.isnan(loss):
                 print(f"\n[Rank {rank}] Warning: NaN loss detected. Skipping batch {i}.")
@@ -172,8 +179,8 @@ def train(rank, world_size, cfg):
         cleanup()
 
 if __name__ == "__main__":
-    world_size = torch.cuda.device_count()
-    if world_size > 1:
-        mp.spawn(train, args=(world_size, cfg), nprocs=world_size, join=True)
-    else:
-        train(0, 1, cfg)
+    # world_size = torch.cuda.device_count()
+    # if world_size > 1:
+    #     mp.spawn(train, args=(world_size, cfg), nprocs=world_size, join=True)
+    # else:
+    train(0, 1, cfg)
