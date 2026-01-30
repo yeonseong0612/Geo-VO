@@ -1,0 +1,7 @@
+[Epoch 0] Avg Loss: 11.6041, Avg T: 0.6945m, Avg R: 0.382030rad
+[Epoch 1] Avg Loss: 6.3325, Avg T: 0.9191m, Avg R: 0.108665rad
+[Epoch 2] Avg Loss: 4.3800, Avg T: 0.9713m, Avg R: 0.012128rad
+[Epoch 3] Avg Loss: 4.3671, Avg T: 0.9640m, Avg R: 0.011726rad
+[Epoch 4] Avg Loss: 4.3505, Avg T: 0.9603m, Avg R: 0.011403rad
+[Epoch 5] Avg Loss: 4.3390, Avg T: 0.9642m, Avg R: 0.011047rad
+[Epoch 6] Avg Loss: 4.3392, Avg T: 0.9538m, Avg R: 0.011138rad

@@ -70,6 +70,28 @@ class DataFactory(data.Dataset):
 
                 cy -= (H_raw % 32)
                 self.calib[seq] = np.array([fx, fy, cx, cy], dtype=np.float32)
+        self.bad_samples = set()
+        bad_list_path = "bad_samples_list.txt"
+        if os.path.exists(bad_list_path):
+            with open(bad_list_path, "r") as f:
+                for line in f:
+                    # 파일명만 추출 (예: 00/pair_000000_000001.npz)
+                    clean_path = line.split(' ')[0]
+                    self.bad_samples.add(clean_path)
+        
+        # 2. 불량 샘플을 제외한 새로운 리스트 생성
+        filtered_list = []
+        for seq, imgnum in self.datalist:
+            pair_name = f"{seq}/pair_{str(imgnum).zfill(6)}_{str(imgnum+1).zfill(6)}.npz"
+            if pair_name not in self.bad_samples:
+                filtered_list.append((seq, imgnum))
+            else:
+                # 확인용 로그 (선택 사항)
+                # print(f"Skipping bad sample: {pair_name}")
+                pass
+        
+        self.datalist = filtered_list
+        print(f"✅ 데이터 필터링 완료: {len(self.bad_samples)}개 제외, 총 {len(self.datalist)}개로 학습 진행")
 
     def __len__(self):
         return len(self.datalist)
@@ -140,31 +162,43 @@ class DataFactory(data.Dataset):
     
 
 def vo_collate_fn(batch):
+    batch = [item for item in batch if item is not None]
+    if len(batch) == 0: return None
+
     result = {
-        'calib': torch.stack([item['calib'] for item in batch]),
+        'calib': torch.stack([item['calib'].clone() for item in batch]),
+        'rel_pose': torch.stack([item['rel_pose'].clone() for item in batch]),
         'seq': [item['seq'] for item in batch],
         'imgnum': [item['imgnum'] for item in batch]
     }
-    
-    if 'rel_pose' in batch[0]:
-        result['rel_pose'] = torch.stack([item['rel_pose'] for item in batch])
 
-    # --- Train 모드 전용 데이터 처리 ---
     if 'kpts' in batch[0]:
-        # 크기가 고정된 [800, ...] 데이터는 stack
-        result['kpts'] = torch.stack([item['kpts'] for item in batch])
-        result['pts_3d'] = torch.stack([item['pts_3d'] for item in batch])
-        result['descs'] = torch.stack([item['descs'] for item in batch])
-        result['mask'] = torch.stack([item['mask'] for item in batch])
-        result['kpts_tp1'] = torch.stack([item['kpts_tp1'] for item in batch])
+        for key in ['kpts', 'pts_3d', 'descs', 'mask', 'kpts_tp1']:
+            result[key] = torch.stack([item[key].clone() for item in batch])
         
-        # [중요] 매칭 쌍(M)과 삼각형(T)은 배치마다 수가 다르므로 리스트로 유지
-        result['temporal_matches'] = [item['temporal_matches'] for item in batch]
-        result['match_scores'] = [item['match_scores'] for item in batch]
-        result['tri_indices'] = [item['tri_indices'] for item in batch]
-    
-    # --- Val/Test 모드 전용 데이터 처리 ---
-    if 'imgs' in batch[0]:
-        result['imgs'] = torch.stack([item['imgs'] for item in batch])
+        # 1. max_tri 계산 시 안전장치 (데이터가 하나도 없을 경우 대비)
+        tri_lengths = [item['tri_indices'].shape[0] for item in batch]
+        max_tri = max(tri_lengths)
+        
+        # 2. 만약 배치 내 모든 샘플에 삼각형이 하나도 없다면 (극단적 상황 대비)
+        if max_tri == 0:
+            result['tri_indices'] = torch.full((len(batch), 1, 3), -1, dtype=torch.long)
+        else:
+            padded_tris = torch.full((len(batch), max_tri, 3), -1, dtype=torch.long)
+            
+            for i, item in enumerate(batch):
+                t_indices = item['tri_indices']
+                t_len = t_indices.shape[0]
+                
+                # 3. 데이터가 있을 때만 복사 수행 (0일 때는 건너뜀)
+                if t_len > 0:
+                    # t_indices의 마지막 차원이 3인지 확인 (안전장치)
+                    if t_indices.ndim == 2 and t_indices.shape[1] == 3:
+                        padded_tris[i, :t_len].copy_(t_indices)
+                    else:
+                        # 예외적인 경우 (Delaunay 실패 등) 로그 출력 후 스킵
+                        continue
+                        
+            result['tri_indices'] = padded_tris
 
     return result

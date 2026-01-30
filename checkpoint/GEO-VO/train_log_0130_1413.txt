@@ -1,0 +1,1 @@
+[Epoch 5] Avg Loss: 8.1538, Avg T: 0.9642m, Avg R: 0.011032rad

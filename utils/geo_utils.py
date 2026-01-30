@@ -79,29 +79,31 @@ def tri_indices_to_edges(tri_indices_list, B, N, device):
 
 
 def compute_individual_Kj(tri_indices, pts_t, pts_tp1):
-        P_t = pts_t[tri_indices]     # [T, 3, 3]
-        P_tp1 = pts_tp1[tri_indices] # [T, 3, 3]
-        
-        P_t_c = P_t - P_t.mean(dim=1, keepdim=True)
-        P_tp1_c = P_tp1 - P_tp1.mean(dim=1, keepdim=True)
+    P_t = pts_t[tri_indices]     # [T, 3, 3]
+    P_tp1 = pts_tp1[tri_indices] # [T, 3, 3]
+    
+    P_t_c = P_t - P_t.mean(dim=1, keepdim=True)
+    P_tp1_c = P_tp1 - P_tp1.mean(dim=1, keepdim=True)
 
-        k_j = torch.matmul(P_t_c.transpose(-2, -1), P_tp1_c)        # [T, 3, 3] = [T, 3, 3] @ [T, 3, 3]
+    k_j = torch.matmul(P_t_c.transpose(-2, -1), P_tp1_c)        # [T, 3, 3] = [T, 3, 3] @ [T, 3, 3]
 
-        return k_j
+    return k_j
 
 def batch_svd(K):
-    K_norm = torch.norm(K, dim=(-2, -1), keepdim=True) + 1e-8
-    K_scaled = K / K_norm
+    B = K.size(0)
+    # 배치별로 미세하게 다른 노이즈를 섞어 특이성(Singularity)을 제거합니다.
+    eps = 1e-5
+    K_safe = K + (torch.eye(3, device=K.device) * eps).expand(B, 3, 3)
+    
+    U, S, Vh = torch.linalg.svd(K_safe)
 
-    K_scaled = K_scaled + torch.randn_like(K_scaled) * 1e-5
-
-    # 3. SVD
-    U, S, Vh = torch.linalg.svd(K_scaled)
+    # 역전파 보호 (특이값 겹침 방지)
+    S = S + torch.tensor([2e-5, 1e-5, 0.0], device=S.device)
 
     R = torch.matmul(U, Vh)
     det = torch.linalg.det(R)
     
-    d = torch.ones((K.size(0), 3), device=K.device)
+    d = torch.ones((B, 3), device=K.device)
     d[:, 2] = torch.where(det < 0, -1.0, 1.0)
     D = torch.diag_embed(d)
 
@@ -118,40 +120,34 @@ def differentiable_voting(xv_j, weights, img_width=1216, sigma=2.0):
     
     # 3. Soft-argmax (최종 소실점 위치 추정)
     probs = torch.softmax(voting_map * 5.0, dim=0) 
-    xv_star = torch.sum(probs * grid)
-    
+    w_safe = weights + 1e-8
+    xv_star = torch.sum(w_safe * xv_j) / torch.sum(w_safe)
     return xv_star
-
     
 def estimate_rotation_svd_differentiable(weights, tri_indices, pts_3d_t, pts_3d_tp1):
-    # 1. 데이터 준비 (기존 동일)
-    P_t = pts_3d_t[tri_indices] 
-    P_tp1 = pts_3d_tp1[tri_indices]
-
-    # 2. 중심 정규화
-    P_t_centered = P_t - P_t.mean(dim=1, keepdim=True)
-    P_tp1_centered = P_tp1 - P_tp1.mean(dim=1, keepdim=True)
-
-    # 3. K_j 및 가중합 K_total 계산
-    K_j = torch.matmul(P_t_centered.transpose(-2, -1), P_tp1_centered)
+    K_j = compute_individual_Kj(tri_indices, pts_3d_t, pts_3d_tp1)
+    
+    # 1. 가중합 계산
     K_total = torch.sum(weights.view(-1, 1, 1) * K_j, dim=0)
-    K_total = K_total / (torch.norm(K_total) + 1e-8) 
-    K_total = K_total + torch.randn_like(K_total) * 1e-5
-
-    # 4. SVD 수행
+    
+    # 2. [핵심] 수치적 안정성 확보
+    # K_total이 0에 너무 가까우면 역전파가 터집니다.
+    K_total = K_total + torch.eye(3, device=weights.device) * 1e-4
+    
+    # 3. SVD 수행
     U, S, Vh = torch.linalg.svd(K_total)
+    
+    # 4. [중요] SVD 역전파 NaN 방지 (특이값 간격 강제 분리)
+    # 특이값이 중복(0,0,0 등)되면 미분 시 분모가 0이 됩니다.
+    S = S + torch.tensor([2e-4, 1e-4, 0.0], device=S.device)
     
     R = U @ Vh
     det = torch.linalg.det(R)
     
+    # 5. Reflection 수정
     d = torch.ones(3, device=weights.device)
-    # sign 함수는 미분 불가능 지점이 있어 where가 더 안전함
-    d[2] = torch.where(det < 0, -1.0, 1.0) 
-    D = torch.diag(d)
-
-    # 6. 최종 R 추출 (순서 중요: U @ D @ Vh)
-    # Row vector 방식 (P_tp1 = P_t @ R)의 정답 순서입니다.
-    R_final = U @ D @ Vh
+    d[2] = torch.where(det < 0, -1.0, 1.0)
+    R_final = U @ torch.diag(d) @ Vh
 
     return R_final
 
@@ -218,5 +214,5 @@ def matrix_to_quat(R):
             quat[idx, 1] = (m12[idx] + m21[idx]) / s
             quat[idx, 2] = 0.25 * s
 
-    # 쿼터니언 정규화 (수치 오차 제거)
-    return quat / torch.norm(quat, dim=-1, keepdim=True)
+    q_norm = torch.norm(quat, dim=-1, keepdim=True)
+    return quat / torch.clamp(q_norm, min=1e-6)

@@ -1,52 +1,55 @@
 import torch
-import numpy as np
+from src.model import VO # 파일명에 맞게 수정하세요
 from lietorch import SE3
-from src.model import VO  # VO 클래스가 정의된 파일 경로
-from utils.geo_utils import *
 
+def test_sanity_check():
+    # 1. 가상의 설정 및 데이터 생성
+    cfg = type('cfg', (), {})() # 더미 cfg
+    model = VO(cfg).cuda().eval() # 테스트는 eval 모드
 
-def test_full_vo_pipeline():
-    print("--- [Verification] Full VO Pipeline Integration Test ---")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 1. 모델 설정
-    cfg = {} # 필요한 설정값들
-    model = VO(cfg).to(device)
-    
-    # 2. 가상 데이터셋 준비 (배치=1)
-    B, N = 1, 800
+    B, N = 2, 800 # 배치 2, 특징점 800개
+    device = "cuda"
+
+    # 가상의 배치를 실제 입력 형태와 동일하게 생성
     batch = {
         'kpts': torch.randn(B, N, 2, device=device),
-        'pts_3d': torch.randn(B, N, 3, device=device) + torch.tensor([0,0,5.0], device=device),
+        'pts_3d': torch.randn(B, N, 3, device=device) * 10.0, # 깊이감 부여
         'descs': torch.randn(B, N, 256, device=device),
         'kpts_tp1': torch.randn(B, N, 2, device=device),
-        'tri_indices': [torch.randint(0, N, (300, 3), device=device)],
-        'mask': torch.ones(B, N, device=device),
-        'calib': torch.tensor([[718., 718., 607., 307.]], device=device)
+        'calib': torch.tensor([[700, 700, 600, 175]] * B, device=device).float(),
+        'tri_indices': [torch.randint(0, N, (1000, 3), device=device) for _ in range(B)],
+        'mask': torch.ones(B, N, device=device)
     }
 
-    # 3. Forward 실행
-    print(f"Running VO forward with 8 iterations...")
+    print("==> Forward Pass 시작...")
+    
     try:
-        # test_model.py 수정 부분
-        outputs = model(batch, iters=8, mode='train')
+        # 2. Forward 실행
+        with torch.no_grad():
+            outputs = model(batch, iters=4)
 
-        # 이제 outputs는 딕셔너리입니다.
-        predictions_pose = outputs['pose_matrices']
-        predictions_conf = outputs['confidences']
+        # 3. 결과물 차원 및 값 검증
+        print("\n[검증 결과]")
+        for i, (pose, conf) in enumerate(zip(outputs['pose_matrices'], outputs['confidences'])):
+            # Pose Matrices 검증 [B, 4, 4]
+            print(f"Iter {i+1} Pose Shape: {pose.shape}")
+            if torch.isnan(pose).any():
+                print(f"❌ Iter {i+1}: Pose에 NaN 발생!")
+            else:
+                print(f"✅ Iter {i+1}: Pose 안정적")
 
-        print(f"Total iterations stored: {len(predictions_pose)}")
-
-        # 마지막 이터레이션의 포즈 가져오기
-        final_pose = predictions_pose[-1] 
-        print(f"Final Pose Shape: {final_pose.shape}")
-
-        print("\n✅ [Success] VO 파이프라인 전체 루프가 성공적으로 실행되었습니다.")
+            # Confidence 검증 [B, N, 1]
+            if torch.isnan(conf).any():
+                print(f"❌ Iter {i+1}: Confidence에 NaN 발생!")
+            else:
+                print(f"✅ Iter {i+1}: Confidence 안정적")
         
+        print("\n==> 모든 이터레이션 통과 성공!")
+
     except Exception as e:
-        print(f"\n❌ [Fail] 파이프라인 실행 중 에러 발생:")
+        print(f"\n❌ 에러 발생: {e}")
         import traceback
         traceback.print_exc()
 
 if __name__ == "__main__":
-    test_full_vo_pipeline()
+    test_sanity_check()

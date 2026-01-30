@@ -14,9 +14,6 @@ from src.model import VO
 from src.loader import DataFactory, vo_collate_fn
 from src.loss import total_loss
 
-# [추가] 역전파 이상 탐지 활성화 - NaN이 발생한 연산 지점을 정확히 짚어줍니다.
-torch.autograd.set_detect_anomaly(True)
-
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
@@ -31,141 +28,149 @@ def train(rank, world_size, cfg):
     if is_ddp:
         setup(rank, world_size)
     
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{rank}")
     
+    # 1. 데이터 로더 설정
     dataset = DataFactory(cfg, mode='train')
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if is_ddp else None
     loader = DataLoader(
         dataset, 
         batch_size=cfg.batchsize, 
         shuffle=(sampler is None),
-        num_workers=0,
+        num_workers=4, # 성능을 위해 4 정도로 상향 권장
         sampler=sampler, 
         collate_fn=vo_collate_fn,
         pin_memory=True
     )
 
+    # 2. 모델 설정
     model = VO(cfg).to(device)
+    
+    # [수정] 체크포인트 로드 (성공적이었던 에포크 4 불러오기)
+    checkpoint_path = "./checkpoint/geovo_epoch_4.pth"
+    start_epoch = 0
+    
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # DDP 저장 방식에 따라 'module.' 접두사 제거가 필요할 수 있음
+        state_dict = checkpoint['model_state_dict']
+        model.load_state_dict(state_dict)
+        start_epoch = checkpoint['epoch'] + 1
+        if rank == 0:
+            print(f"✅ 체크포인트 로드 성공: {checkpoint_path} (에포크 {start_epoch}부터 재개)")
+            
+    # [핵심] log_lmbda 고정 (수치적 안정성 확보)
+    model.log_lmbda.requires_grad = False
+    
     if is_ddp:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        raw_model = model.module
+    else:
+        raw_model = model
     
-    raw_model = model.module if is_ddp else model
-    
-    # log_lmbda는 상수로 고정되었으므로 제외된 params 리스트 사용
-    params = [
-        {'params': [p for n, p in raw_model.named_parameters() if 'log_lmbda' not in n], 'lr': cfg.learning_rate}
-    ]
-
-    optimizer = optim.AdamW(params, cfg.weight_decay)
-    scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=cfg.MultiStepLR_milstone, gamma=cfg.MultiStepLR_gamma
+    # 3. 옵티마이저 설정
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()), 
+        lr=cfg.learning_rate * 0.2, 
+        weight_decay=cfg.weight_decay
     )
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=cfg.MultiStepLR_milstone, gamma=cfg.MultiStepLR_gamma)
 
+    # 4. 로그 파일 설정
     log_file = None
     if rank == 0:
-        if not os.path.exists(cfg.logdir):
-            os.makedirs(cfg.logdir)
-        
+        if not os.path.exists(cfg.logdir): os.makedirs(cfg.logdir)
         log_path = os.path.join(cfg.logdir, f"train_log_{datetime.now().strftime('%m%d_%H%M')}.txt")
         log_file = open(log_path, "w")
-        log_file.write(f"Training Start: {datetime.now()}\n")
-        log_file.write(f"Anomaly Detection: ON\n") # 이상 탐지 모드 기록
-        log_file.write(f"Config: Epochs={cfg.maxepoch}, BatchSize={cfg.batchsize}, LR={cfg.learning_rate}\n")
-        log_file.write("-" * 100 + "\n")
-        log_file.flush()
-        print(f"==> 학습 시작 (이상 탐지 모드): Log 저장위치={log_path}")
+        print(f"🚀 Fine-tuning 시작 | GPU 개수: {world_size} | 로그: {log_path}")
 
-    for epoch in range(cfg.maxepoch):
-        if is_ddp:
-            sampler.set_epoch(epoch)
-        
+    # 학습 루프
+    for epoch in range(start_epoch, cfg.maxepoch):
+        if is_ddp: sampler.set_epoch(epoch)
         model.train()
-        epoch_loss = 0.0
-        epoch_t_err = 0.0
-        epoch_r_err = 0.0
-        epoch_l_w = 0.0
+        
+        # [에러 해결] 각 에폭 시작 시 모니터링 변수 초기화
+        avg_loss, avg_t, avg_r = 0.0, 0.0, 0.0
+        epoch_loss, epoch_t, epoch_r = 0.0, 0.0, 0.0
         
         pbar = tqdm(loader, desc=f"Epoch {epoch}", disable=(rank != 0))
         
         for i, batch in enumerate(pbar):
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device)
+            
             optimizer.zero_grad()
             
-            # Forward 연산
-            outputs = model(batch, iters=8) 
+            # 모델 추론 (iters=4 유지, 재투영 오차 포함)
+            outputs = model(batch, iters=4, mode='train')
             
-            with torch.no_grad():
-                init_R = outputs['pose_matrices'][0]
-                det_val = torch.det(init_R[:, :3, :3])
-                # Det(R)이 NaN이면 이미 Forward에서 터진 것
-                if torch.isnan(det_val).any():
-                    print(f"\n[Rank {rank}] !!! Forward NaN Detected in Det(R) at Batch {i} !!!")
+            # [수정] total_loss 반환값 개수 일치 (final_loss, t_err, r_err, l_weight)
+            loss, t_err, r_err, l_weight = total_loss(outputs, batch)
 
-            loss, t_err, r_err, l_w = total_loss(outputs, batch)
-            
             if torch.isnan(loss):
-                print(f"\n[Rank {rank}] Warning: NaN loss detected at batch {i}. Skipping.")
+                print(f"⚠️ Skip NaN Loss at Epoch {epoch}, Batch {i}")
                 continue
 
-            # [핵심] Backward 연산 시 이상 탐지 작동
-            try:
-                loss.backward()
-            except RuntimeError as e:
-                print("\n" + "!"*60)
-                print(f"🚨 [Rank {rank}] Backward NaN Detected at Batch {i}!")
-                print(f"Error Details: {e}")
-                print("!"*60)
-                # 로그에 에러 기록 후 종료
-                if rank == 0:
-                    log_file.write(f"ERROR at Batch {i}: {str(e)}\n")
-                    log_file.close()
-                return # 학습 중단
+            loss.backward()
 
-            # 그래디언트 클리핑 (더 보수적으로 0.1 설정)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+            # [핵심] Gradient Clipping: 0.94m 정체기 돌파 시 갑작스러운 폭주 방지
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
-
-            # 지표 업데이트
-            epoch_loss += loss.item()
-            epoch_t_err += t_err
-            epoch_r_err += r_err
-            epoch_l_w += l_w.item() if torch.is_tensor(l_w) else l_w
             
-            avg_loss = epoch_loss / (i + 1)
-            avg_t_err = epoch_t_err / (i + 1)
-            avg_r_err = epoch_r_err / (i + 1)
-
-            curr_lmbda = torch.exp(raw_model.log_lmbda).item()
-
+            # 통계 업데이트
+            loss_val = loss.item()
+            epoch_loss += loss_val
+            epoch_t += t_err
+            epoch_r += r_err
+            
             if rank == 0:
+                # 이동 평균 계산
+                avg_loss = (avg_loss * i + loss_val) / (i + 1)
+                avg_t = (avg_t * i + t_err) / (i + 1)
+                avg_r = (avg_r * i + r_err) / (i + 1)
+
                 pbar.set_postfix({
-                    "L": f"{avg_loss:.3f}", 
-                    "T": f"{avg_t_err:.3f}m", 
-                    "R": f"{avg_r_err:.3f}rad",
-                    "Lm": f"{curr_lmbda:.1e}"
+                    'L(avg/cur)': f"{avg_loss:.3f}/{loss_val:.3f}",
+                    'T(avg/cur)': f"{avg_t:.3f}/{t_err:.3f}m",
+                    'R(avg/cur)': f"{avg_r:.4f}/{r_err:.4f}r"
                 })
 
         scheduler.step()
 
+        # 에포크 종료 후 저장 및 기록
         if rank == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            log_str = (f"[Epoch {epoch}] AvgL: {avg_loss:.5f} | AvgT: {avg_t_err:.5f} | AvgR: {avg_r_err:.5f} | "
-                       f"Lm: {curr_lmbda:.2e} | LR: {current_lr:.7f}\n")
-            print(f"\n{log_str}")
+            final_avg_loss = epoch_loss / len(loader)
+            final_avg_t = epoch_t / len(loader)
+            final_avg_r = epoch_r / len(loader)
+            
+            log_str = f"[Epoch {epoch}] Avg Loss: {final_avg_loss:.4f}, Avg T: {final_avg_t:.4f}m, Avg R: {final_avg_r:.6f}rad\n"
             log_file.write(log_str)
             log_file.flush()
 
-            save_path = os.path.join(cfg.logdir, f"vo_model_{epoch}.pth")
+            checkpoint_dir = "./checkpoint/5"
+            if not os.path.exists(checkpoint_dir): os.makedirs(checkpoint_dir)
+            
+            save_path = os.path.join(checkpoint_dir, f"geovo_epoch_{epoch}.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': raw_model.state_dict(),
-                'lmbda': curr_lmbda
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': final_avg_loss,
+                'log_lmbda': raw_model.log_lmbda.data
             }, save_path)
+            print(f"💾 Epoch {epoch} 모델 저장 완료: {save_path}")
 
-    if rank == 0:
-        log_file.write(f"Training Finished: {datetime.now()}\n")
-        log_file.close()
-    if is_ddp:
-        cleanup()
+    if is_ddp: cleanup()
+    if log_file: log_file.close()
+
+def main():
+    world_size = torch.cuda.device_count()
+    if world_size > 1:
+        mp.spawn(train, args=(world_size, cfg), nprocs=world_size, join=True)
+    else:
+        train(0, 1, cfg)
 
 if __name__ == "__main__":
-    train(0, 1, cfg)
+    main()

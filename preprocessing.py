@@ -85,36 +85,41 @@ class GeoVOPreprocess:
         matches = matches_dict['matches'][0].cpu().numpy()
         idx_l, idx_r = matches[:, 0], matches[:, 1]
 
-        # 1. Disparity 계산
+        # 1. Disparity 계산 및 기초 필터링
         disp = kpts_l[idx_l, 0] - kpts_r[idx_r, 0]
         y_error = np.abs(kpts_l[idx_l, 1] - kpts_r[idx_r, 1])
 
-        # 2. 강력한 필터링 (음수 및 0에 가까운 시차 제거)
-        # disp < 2.0이면 너무 멀거나(Z > 150m) 오매칭일 확률이 높음
-        valid = (disp > 2.0) & (y_error < 2.0)
-        
-        idx_l_v = idx_l[valid]
-        disp_v = disp[valid]
+        # [수정] 최소 변위(min_disparity) 설정
+        # KITTI 기준 f*B ~= 380~390입니다. 
+        # disp가 3.0이면 약 130m, 5.0이면 약 77m입니다.
+        # 안정적인 추적을 위해 disp 3.0~4.0 미만은 버리는 것이 안전합니다.
+        min_disp = 3.0 
+        valid_disp = (disp > min_disp) & (y_error < 1.0) # y_error도 2.0은 좀 넉넉하므로 1.0 권장
 
-        # [핵심] 초기값을 (0, 0, 0)이 아닌 안전한 양수 혹은 0으로 세팅
-        # 나중에 모델에서 1/Z 연산을 할 때 0이나 음수가 들어오면 폭발하므로 
-        # 사용하지 않는 점들은 기본적으로 0으로 둡니다.
+        idx_l_v = idx_l[valid_disp]
+        disp_v = disp[valid_disp]
+
+        # 초기화
         pts_3d = np.zeros((kpts_l.shape[0], 3), dtype=np.float32)
+        pts_3d[:, 2] = -1.0 # 유효하지 않은 점은 음수 혹은 -1로 표기
         
         fx, cx, cy = K[0, 0], K[0, 2], K[1, 2]
         z = (fx * self.baseline) / disp_v
         
-        # 3. 물리적으로 가능한 거리(0.5m ~ 100m)만 통과
-        z_mask = (z > 0.5) & (z < 100.0)
+        # 2. 유효 거리 범위 (KITTI 기준 2m ~ 80m 권장)
+        # 80m 이상은 매칭 정확도가 급격히 떨어집니다.
+        z_min, z_max = 2.0, 80.0
+        z_mask = (z > z_min) & (z < z_max)
+        
         final_idx = idx_l_v[z_mask]
         final_z = z[z_mask]
 
+        # 3D 좌표 할당
         pts_3d[final_idx, 0] = (kpts_l[final_idx, 0] - cx) * final_z / fx
         pts_3d[final_idx, 1] = (kpts_l[final_idx, 1] - cy) * final_z / fx
         pts_3d[final_idx, 2] = final_z
 
         return pts_3d, set(final_idx.tolist())
-
     @torch.no_grad()
     def process_pair(self, batch_t, batch_tp1):
         # ... (추출 및 매칭 로직은 동일) ...
